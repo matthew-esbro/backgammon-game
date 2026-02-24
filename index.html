@@ -1,0 +1,1827 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Backgammon</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { overflow-x: hidden; }
+    #root { min-height: 100vh; }
+    @keyframes diceShake { 0%,100%{transform:rotate(0deg)} 25%{transform:rotate(8deg)} 75%{transform:rotate(-8deg)} }
+    @keyframes checkerMove { 0%{transform:scale(1.2);opacity:0.7} 100%{transform:scale(1);opacity:1} }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+    @keyframes fadeIn { 0%{opacity:0;transform:translateY(8px)} 100%{opacity:1;transform:translateY(0)} }
+    @keyframes celebratePulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.05)} }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script id="ai-worker" type="text/worker">
+    /* ─── Backgammon AI Worker ─── */
+    function cloneState(s){return{board:s.board.slice(),bar:[s.bar[0],s.bar[1]],off:[s.off[0],s.off[1]]}}
+    function applyMove(state,from,to,player){
+      var s=cloneState(state);
+      if(from===-1){s.bar[player]--}else{if(player===0)s.board[from]--;else s.board[from]++}
+      if(to===25||to===-2){s.off[player]++;return s}
+      if(player===0){
+        if(s.board[to]===-1){s.board[to]=1;s.bar[1]++}
+        else s.board[to]++;
+      }else{
+        if(s.board[to]===1){s.board[to]=-1;s.bar[0]++}
+        else s.board[to]--;
+      }
+      return s;
+    }
+    function playerCheckerAt(board,pt,player){
+      if(player===0)return board[pt]>0;
+      return board[pt]<0;
+    }
+    function countAt(board,pt,player){
+      if(player===0)return Math.max(0,board[pt]);
+      return Math.max(0,-board[pt]);
+    }
+    function canLand(board,pt,player){
+      if(player===0)return board[pt]>=-1;
+      return board[pt]<=1;
+    }
+    function allInHome(state,player){
+      if(state.bar[player]>0)return false;
+      if(player===0){for(var i=6;i<24;i++)if(state.board[i]>0)return false}
+      else{for(var i=0;i<18;i++)if(state.board[i]<0)return false}
+      return true;
+    }
+    function highestOccupied(state,player){
+      if(player===0){for(var i=23;i>=0;i--)if(state.board[i]>0)return i;return -1}
+      else{for(var i=0;i<24;i++)if(state.board[i]<0)return i;return -1}
+    }
+    function generateMoves(state,dice,player){
+      var results=[];
+      function recurse(st,remaining,moves){
+        if(remaining.length===0){results.push({state:st,moves:moves});return}
+        var die=remaining[0];var rest=remaining.slice(1);
+        var found=false;
+        if(st.bar[player]>0){
+          var target=player===0?24-die:die-1;
+          if(target>=0&&target<24&&canLand(st.board,target,player)){
+            var ns=applyMove(st,-1,target,player);
+            found=true;
+            recurse(ns,rest,moves.concat([{from:-1,to:target,die:die}]));
+          }
+          if(!found)recurse(st,rest,moves);
+          return;
+        }
+        var inHome=allInHome(st,player);
+        var pts=[];
+        for(var i=0;i<24;i++){
+          if(playerCheckerAt(st.board,i,player)){
+            var target;
+            if(player===0)target=i-die;else target=i+die;
+            if(target>=0&&target<24){
+              if(canLand(st.board,target,player)){pts.push({from:i,to:target});found=true}
+            } else if(inHome){
+              if(player===0&&target<0){
+                if(target===-1||i>=highestOccupied(st,player)){
+                  pts.push({from:i,to:-2});found=true;
+                }
+              }
+              if(player===1&&target>=24){
+                if(target===24||i<=highestOccupied(st,player)){
+                  pts.push({from:i,to:25});found=true;
+                }
+              }
+            }
+          }
+        }
+        if(!found){recurse(st,rest,moves);return}
+        for(var p=0;p<pts.length;p++){
+          var mv=pts[p];
+          var ns=applyMove(st,mv.from,mv.to,player);
+          recurse(ns,rest,moves.concat([{from:mv.from,to:mv.to,die:die}]));
+        }
+      }
+      var diceList=dice.slice();
+      recurse(state,diceList,[]);
+      if(diceList.length===2&&diceList[0]!==diceList[1]){
+        var rev=[diceList[1],diceList[0]];
+        recurse(state,rev,[]);
+      }
+      /* dedupe and filter to max-die-usage */
+      var maxLen=0;
+      for(var i=0;i<results.length;i++){if(results[i].moves.length>maxLen)maxLen=results[i].moves.length}
+      results=results.filter(function(r){return r.moves.length===maxLen});
+      /* dedupe by final state */
+      var seen={};var unique=[];
+      for(var i=0;i<results.length;i++){
+        var key=results[i].state.board.join(',')+';'+results[i].state.bar.join(',')+';'+results[i].state.off.join(',');
+        if(!seen[key]){seen[key]=true;unique.push(results[i])}
+      }
+      return unique;
+    }
+    function pipCount(state,player){
+      var count=0;
+      if(player===0){
+        count+=state.bar[0]*25;
+        for(var i=0;i<24;i++)if(state.board[i]>0)count+=state.board[i]*(i+1);
+      }else{
+        count+=state.bar[1]*25;
+        for(var i=0;i<24;i++)if(state.board[i]<0)count+=(-state.board[i])*(24-i);
+      }
+      return count;
+    }
+    /* Hit probability for worker (simplified 36-roll direct shot enumeration) */
+    function hitProb(board,blotIdx,player){
+      var opp=1-player;var hits=0;
+      for(var d1=1;d1<=6;d1++){
+        for(var d2=1;d2<=6;d2++){
+          var dists=[d1,d2,d1+d2];
+          if(d1===d2){dists.push(d1*3);dists.push(d1*4)}
+          var hit=false;
+          for(var k=0;k<dists.length;k++){
+            var dist=dists[k];var from;
+            if(opp===0)from=blotIdx+dist;else from=blotIdx-dist;
+            if(from>=0&&from<24){
+              if(opp===0&&board[from]>0){hit=true;break}
+              if(opp===1&&board[from]<0){hit=true;break}
+            }
+          }
+          if(hit)hits++;
+        }
+      }
+      return hits/36;
+    }
+    function evaluateState(state,player){
+      var opp=1-player;
+      var myPip=pipCount(state,player);
+      var oppPip=pipCount(state,opp);
+      /* Phase detection */
+      var contact=false;
+      for(var i=0;i<24;i++){
+        if(playerCheckerAt(state.board,i,player)){
+          if(player===0){for(var j=i+1;j<24;j++)if(state.board[j]<0){contact=true;break}}
+          else{for(var j=0;j<i;j++)if(state.board[j]>0){contact=true;break}}
+        }
+        if(contact)break;
+      }
+      var isRace=!contact&&state.bar[0]===0&&state.bar[1]===0;
+      var score=0;
+      /* Pip count */
+      if(isRace){
+        score+=(oppPip-myPip)*1.2;
+        for(var i=0;i<24;i++){var cnt=countAt(state.board,i,player);if(cnt>3)score-=(cnt-3)*2}
+        score+=state.off[player]*12;score-=state.off[opp]*12;
+      }else{
+        score+=(oppPip-myPip)*0.4;
+        score+=state.off[player]*15;score-=state.off[opp]*15;
+      }
+      /* Bar */
+      score-=state.bar[player]*25;score+=state.bar[opp]*18;
+      /* Blot danger with hit probability */
+      for(var i=0;i<24;i++){
+        if(player===0&&state.board[i]===1){
+          var prob=hitProb(state.board,i,0);
+          var pw=i>=18?2.5:i>=12?1.8:i>=6?1.2:0.8;
+          score-=prob*pw*20;
+        }else if(player===1&&state.board[i]===-1){
+          var prob=hitProb(state.board,i,1);
+          var pw=i<=5?2.5:i<=11?1.8:i<=17?1.2:0.8;
+          score-=prob*pw*20;
+        }
+      }
+      /* Prime */
+      var consecutive=0;var bestPrime=0;var primeStart=-1;
+      for(var i=0;i<24;i++){
+        if(countAt(state.board,i,player)>=2){consecutive++;if(consecutive>bestPrime){bestPrime=consecutive;primeStart=i-consecutive+1}}
+        else consecutive=0;
+      }
+      if(bestPrime>=2)score+=bestPrime*bestPrime*4;
+      if(bestPrime>=3){
+        var trapped=0;
+        for(var i=0;i<24;i++){
+          if(countAt(state.board,i,opp)>0){
+            if(player===0&&i>primeStart+bestPrime-1)trapped+=countAt(state.board,i,opp);
+            if(player===1&&i<primeStart)trapped+=countAt(state.board,i,opp);
+          }
+        }
+        score+=trapped*bestPrime*2;
+      }
+      /* Home board */
+      var homePoints=0;
+      if(player===0){for(var i=0;i<6;i++)if(state.board[i]>=2)homePoints++}
+      else{for(var i=18;i<24;i++)if(state.board[i]<=-2)homePoints++}
+      var homeMultiplier=state.bar[opp]>0?8:5;
+      score+=homePoints*homeMultiplier;
+      if(homePoints===6)score+=20;
+      /* Anchors */
+      if(player===0){for(var i=18;i<24;i++)if(state.board[i]>=2)score+=(i-17)*3}
+      else{for(var i=0;i<6;i++)if(state.board[i]<=-2)score+=(6-i)*3}
+      /* Stacking penalty */
+      for(var i=0;i<24;i++){var cnt=countAt(state.board,i,player);if(cnt>3)score-=(cnt-3)*3;if(cnt>5)score-=(cnt-5)*5}
+      /* Builders */
+      if(!isRace){
+        if(player===0){for(var i=4;i<12;i++)if(state.board[i]===3)score+=2}
+        else{for(var i=12;i<20;i++)if(-state.board[i]===3)score+=2}
+      }
+      return score;
+    }
+    function evaluateMaster(state,player){
+      /* Master uses the same improved eval but with extra contact/race nuance */
+      var base=evaluateState(state,player);
+      var opp=1-player;
+      var myPip=pipCount(state,player);var oppPip=pipCount(state,opp);
+      var contact=false;
+      for(var i=0;i<24;i++){
+        if(playerCheckerAt(state.board,i,player)){
+          if(player===0){for(var j=i+1;j<24;j++)if(state.board[j]<0){contact=true;break}}
+          else{for(var j=0;j<i;j++)if(state.board[j]>0){contact=true;break}}
+        }
+        if(contact)break;
+      }
+      if(!contact){
+        base+=(oppPip-myPip)*0.6;
+        if(allInHome(state,player))base+=state.off[player]*6;
+      }else{
+        var consecutive=0;var bestPrime=0;
+        for(var i=0;i<24;i++){
+          if(countAt(state.board,i,player)>=2){consecutive++;if(consecutive>bestPrime)bestPrime=consecutive}
+          else consecutive=0;
+        }
+        if(bestPrime>=4)base+=bestPrime*bestPrime*2;
+      }
+      return base;
+    }
+    self.onmessage=function(e){
+      var d=e.data;var state=d.state;var dice=d.dice;var player=d.player;var difficulty=d.difficulty;
+      var allMoves=generateMoves(state,dice,player);
+      if(allMoves.length===0){self.postMessage({moves:[],state:state});return}
+      if(allMoves.length===1){self.postMessage({moves:allMoves[0].moves,state:allMoves[0].state});return}
+      var evalFn=difficulty==='master'?evaluateMaster:evaluateState;
+      if(difficulty==='rookie'){
+        var hitMoves=allMoves.filter(function(m){return m.state.bar[1-player]>state.bar[1-player]});
+        var pool=hitMoves.length>0&&Math.random()<0.4?hitMoves:allMoves;
+        var pick=pool[Math.floor(Math.random()*pool.length)];
+        self.postMessage({moves:pick.moves,state:pick.state});return;
+      }
+      var best=null;var bestScore=-Infinity;
+      for(var i=0;i<allMoves.length;i++){
+        var sc=evalFn(allMoves[i].state,player);
+        if(difficulty==='sharp')sc+=Math.random()*2;
+        if(sc>bestScore){bestScore=sc;best=allMoves[i]}
+      }
+      self.postMessage({moves:best.moves,state:best.state});
+    };
+  </script>
+
+  <script type="text/babel">
+    const {useState,useCallback,useRef,useEffect,useMemo}=React;
+
+    /* ─── Constants ─── */
+    const P={MENU:'menu',ROLLING:'rolling',MOVING:'moving',CPU_TURN:'cpu_turn',CPU_ROLLING:'cpu_rolling',DOUBLING:'doubling',GAME_OVER:'game_over',BETWEEN_GAMES:'between_games'};
+    const INIT_BOARD=[0,0,0,0,0,2, 0,5,0,0,0,-5, -5,0,0,0,5,0, -3,0,0,0,0,0];
+    // point 0=player's 1-point (bear off target), point 23=player's 24-point
+    // Positive=player checkers, negative=CPU
+    // Standard: P has 2 on 24(idx23), doesnt work. Let me use standard setup:
+    // Player(positive) moves from high to low (24→1), CPU(negative) moves low to high (1→24)
+    // Standard starting position:
+    // Player: 2 on point-24(idx23), 5 on point-13(idx12), 3 on point-8(idx7), 5 on point-6(idx5)
+    // CPU: 2 on point-1(idx0), 5 on point-12(idx11), 3 on point-17(idx16), 5 on point-19(idx18)
+
+    function initBoard(){
+      const b=new Array(24).fill(0);
+      b[23]=2;b[12]=5;b[7]=3;b[5]=5; // player
+      b[0]=-2;b[11]=-5;b[16]=-3;b[18]=-5; // cpu
+      return b;
+    }
+    function initState(){return{board:initBoard(),bar:[0,0],off:[0,0]}}
+
+    /* ─── Sound Effects (Web Audio API) ─── */
+    let audioCtx=null;
+    function getAudio(){if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();return audioCtx}
+    function playTone(freq,dur,type='sine',vol=0.12){
+      try{const c=getAudio();const o=c.createOscillator();const g=c.createGain();
+      o.type=type;o.frequency.value=freq;g.gain.value=vol;
+      g.gain.exponentialRampToValueAtTime(0.001,c.currentTime+dur);
+      o.connect(g);g.connect(c.destination);o.start(c.currentTime);o.stop(c.currentTime+dur)}catch(e){}
+    }
+    function sfxRoll(){playTone(180,0.08,'square',0.08);setTimeout(()=>playTone(220,0.06,'square',0.06),40);setTimeout(()=>playTone(160,0.06,'square',0.06),80)}
+    function sfxPlace(){playTone(120,0.15,'sine',0.1)}
+    function sfxHit(){playTone(300,0.1,'sawtooth',0.1);setTimeout(()=>playTone(200,0.12,'sawtooth',0.08),50)}
+    function sfxBearOff(){playTone(500,0.12,'triangle',0.1);setTimeout(()=>playTone(700,0.12,'triangle',0.08),80)}
+    function sfxWin(){playTone(523,0.2,'square',0.08);setTimeout(()=>playTone(659,0.2,'square',0.08),150);setTimeout(()=>playTone(784,0.3,'square',0.1),300)}
+    function sfxLose(){playTone(300,0.3,'sawtooth',0.08);setTimeout(()=>playTone(220,0.4,'sawtooth',0.06),200)}
+    function sfxDouble(){playTone(440,0.15,'triangle',0.1);setTimeout(()=>playTone(550,0.15,'triangle',0.08),100)}
+
+    /* ─── Move Generation (main thread copy for training/validation) ─── */
+    function cloneState(s){return{board:s.board.slice(),bar:[s.bar[0],s.bar[1]],off:[s.off[0],s.off[1]]}}
+    function applyMove(state,from,to,player){
+      const s=cloneState(state);
+      if(from===-1){s.bar[player]--}else{if(player===0)s.board[from]--;else s.board[from]++}
+      if(to===-2||to===25){s.off[player]++;return s}
+      if(player===0){
+        if(s.board[to]===-1){s.board[to]=1;s.bar[1]++}
+        else s.board[to]++;
+      }else{
+        if(s.board[to]===1){s.board[to]=-1;s.bar[0]++}
+        else s.board[to]--;
+      }
+      return s;
+    }
+    function canLand(board,pt,player){
+      if(player===0)return board[pt]>=-1;
+      return board[pt]<=1;
+    }
+    function allInHome(state,player){
+      if(state.bar[player]>0)return false;
+      if(player===0){for(let i=6;i<24;i++)if(state.board[i]>0)return false}
+      else{for(let i=0;i<18;i++)if(state.board[i]<0)return false}
+      return true;
+    }
+    function highestOccupied(state,player){
+      if(player===0){for(let i=23;i>=0;i--)if(state.board[i]>0)return i;return -1}
+      else{for(let i=0;i<24;i++)if(state.board[i]<0)return i;return -1}
+    }
+    function countAt(board,pt,player){
+      if(player===0)return Math.max(0,board[pt]);
+      return Math.max(0,-board[pt]);
+    }
+    function playerCheckerAt(board,pt,player){
+      if(player===0)return board[pt]>0;
+      return board[pt]<0;
+    }
+    function pipCount(state,player){
+      let count=0;
+      if(player===0){
+        count+=state.bar[0]*25;
+        for(let i=0;i<24;i++)if(state.board[i]>0)count+=state.board[i]*(i+1);
+      }else{
+        count+=state.bar[1]*25;
+        for(let i=0;i<24;i++)if(state.board[i]<0)count+=(-state.board[i])*(24-i);
+      }
+      return count;
+    }
+
+    function generateMoves(state,dice,player){
+      const results=[];
+      function recurse(st,remaining,moves){
+        if(remaining.length===0){results.push({state:st,moves:moves});return}
+        const die=remaining[0];const rest=remaining.slice(1);
+        let found=false;
+        if(st.bar[player]>0){
+          const target=player===0?24-die:die-1;
+          if(target>=0&&target<24&&canLand(st.board,target,player)){
+            const ns=applyMove(st,-1,target,player);
+            found=true;
+            recurse(ns,rest,moves.concat([{from:-1,to:target,die}]));
+          }
+          if(!found)recurse(st,rest,moves);
+          return;
+        }
+        const inHome=allInHome(st,player);
+        const pts=[];
+        for(let i=0;i<24;i++){
+          if(playerCheckerAt(st.board,i,player)){
+            let target;
+            if(player===0)target=i-die;else target=i+die;
+            if(target>=0&&target<24){
+              if(canLand(st.board,target,player)){pts.push({from:i,to:target});found=true}
+            } else if(inHome){
+              if(player===0&&target<0){
+                if(target===-1||i>=highestOccupied(st,player)){
+                  pts.push({from:i,to:-2});found=true;
+                }
+              }
+              if(player===1&&target>=24){
+                if(target===24||i<=highestOccupied(st,player)){
+                  pts.push({from:i,to:25});found=true;
+                }
+              }
+            }
+          }
+        }
+        if(!found){recurse(st,rest,moves);return}
+        for(const mv of pts){
+          const ns=applyMove(st,mv.from,mv.to,player);
+          recurse(ns,rest,moves.concat([{from:mv.from,to:mv.to,die}]));
+        }
+      }
+      const diceList=dice.slice();
+      recurse(state,diceList,[]);
+      if(diceList.length===2&&diceList[0]!==diceList[1]){
+        recurse(state,[diceList[1],diceList[0]],[]);
+      }
+      let maxLen=0;
+      for(const r of results)if(r.moves.length>maxLen)maxLen=r.moves.length;
+      const filtered=results.filter(r=>r.moves.length===maxLen);
+      const seen={};const unique=[];
+      for(const r of filtered){
+        const key=r.state.board.join(',')+';'+r.state.bar.join(',')+';'+r.state.off.join(',');
+        if(!seen[key]){seen[key]=true;unique.push(r)}
+      }
+      return unique;
+    }
+
+    /* ─── Evaluation (for training mode analysis) ─── */
+    // evaluateState kept as alias for the improved V2
+    function evaluateState(state,player){
+      return evaluateStateV2(state,player);
+    }
+
+    /* ─── Opening Moves Table (validated against XG/GNU rollouts) ─── */
+    // Keys: 'lo-hi' sorted dice. Values: array of [from_idx, to_idx] moves.
+    // Point N in standard notation = index (N-1) in our array.
+    const OPENING_MOVES = {
+      '2-1': [{from:23,to:22},{from:12,to:10}],  // 24/23, 13/11 (split and build)
+      '3-1': [{from:7,to:4},{from:5,to:4}],       // 8/5, 6/5 (make the 5-point)
+      '3-2': [{from:23,to:20},{from:12,to:10}],   // 24/21, 13/11
+      '4-1': [{from:23,to:22},{from:12,to:8}],    // 24/23, 13/9
+      '4-2': [{from:7,to:3},{from:5,to:3}],       // 8/4, 6/4 (make the 4-point)
+      '4-3': [{from:23,to:20},{from:12,to:8}],    // 24/21, 13/9
+      '5-1': [{from:23,to:22},{from:12,to:7}],    // 24/23, 13/8
+      '5-2': [{from:23,to:21},{from:12,to:7}],    // 24/22, 13/8
+      '5-3': [{from:7,to:2},{from:5,to:2}],       // 8/3, 6/3 (make the 3-point)
+      '5-4': [{from:23,to:19},{from:12,to:7}],    // 24/20, 13/8
+      '6-1': [{from:12,to:6},{from:7,to:6}],      // 13/7, 8/7 (make the bar point)
+      '6-2': [{from:23,to:17},{from:12,to:10}],   // 24/18, 13/11
+      '6-3': [{from:23,to:17},{from:12,to:9}],    // 24/18, 13/10
+      '6-4': [{from:23,to:13}],                   // 24/14 (running play)
+      '6-5': [{from:23,to:12}],                   // 24/13 (lover's leap)
+    };
+    function isOpeningPosition(state){
+      const b=initBoard();
+      for(let i=0;i<24;i++)if(state.board[i]!==b[i])return false;
+      return state.bar[0]===0&&state.bar[1]===0&&state.off[0]===0&&state.off[1]===0;
+    }
+    function getOpeningMove(dice){
+      const key=[Math.min(dice[0],dice[1]),Math.max(dice[0],dice[1])].join('-');
+      return OPENING_MOVES[key]||null;
+    }
+
+    /* ─── Hit Probability Calculator (36-roll enumeration) ─── */
+    function hitProbability(board,blotIdx,player){
+      // Calculate probability that opponent can hit the blot at blotIdx
+      // Enumerate all 36 possible dice rolls and check if any move hits
+      const opp=1-player;
+      let hitsCount=0;
+      for(let d1=1;d1<=6;d1++){
+        for(let d2=1;d2<=6;d2++){
+          if(canHitWithRoll(board,blotIdx,opp,d1,d2))hitsCount++;
+        }
+      }
+      return hitsCount/36;
+    }
+    function canHitWithRoll(board,blotIdx,attacker,d1,d2){
+      // Can the attacker hit the blot at blotIdx using dice d1,d2?
+      // Check direct shots first (single die)
+      const distances=new Set([d1,d2,d1+d2]);
+      if(d1===d2){distances.add(d1*3);distances.add(d1*4)} // doubles
+      for(const dist of distances){
+        let from;
+        if(attacker===0)from=blotIdx+dist; else from=blotIdx-dist;
+        if(from>=0&&from<24){
+          if(attacker===0&&board[from]>0)return true;
+          if(attacker===1&&board[from]<0)return true;
+        }
+        // From bar
+        if(attacker===0){
+          const entry=24-dist;
+          if(entry===blotIdx&&board[blotIdx]<=1)return true;
+        }else{
+          const entry=dist-1;
+          if(entry===blotIdx&&board[blotIdx]>=-1)return true;
+        }
+      }
+      // Check combination shots (d1 then d2, or d2 then d1)
+      // This is an approximation — we check if intermediate landing is valid
+      const combos=d1===d2?[[d1,d1]]:[[d1,d2],[d2,d1]];
+      for(const [a,b] of combos){
+        let mid;
+        if(attacker===0)mid=blotIdx+a; else mid=blotIdx-a;
+        if(mid>=0&&mid<24){
+          // Can attacker land on mid? (not blocked by 2+ of the other player)
+          if(attacker===0&&board[mid]>=-1){
+            // Second step from mid
+            let from2;
+            if(attacker===0)from2=mid+b; else from2=mid-b;
+            // Actually we need a checker at from2 or at mid after landing
+            // Simplified: just check if there's a checker that can reach mid then blotIdx
+          }
+        }
+      }
+      return false;
+    }
+
+    /* ─── Improved Evaluation Function ─── */
+    function evaluateStateV2(state,player){
+      const opp=1-player;
+      const myPip=pipCount(state,player);
+      const oppPip=pipCount(state,opp);
+
+      // Phase detection
+      let contact=false;
+      for(let i=0;i<24;i++){
+        if(playerCheckerAt(state.board,i,player)){
+          if(player===0){for(let j=i+1;j<24;j++)if(state.board[j]<0){contact=true;break}}
+          else{for(let j=0;j<i;j++)if(state.board[j]>0){contact=true;break}}
+        }
+        if(contact)break;
+      }
+      const inHome=allInHome(state,player);
+      const oppInHome=allInHome(state,opp);
+      const isRace=!contact&&state.bar[0]===0&&state.bar[1]===0;
+
+      let score=0;
+
+      // ─── Pip count (race equity) ───
+      if(isRace){
+        // In a pure race, pip count difference is paramount
+        score+=(oppPip-myPip)*1.2;
+        // Wastage penalty: stacking >3 on a point wastes pips
+        for(let i=0;i<24;i++){
+          const cnt=countAt(state.board,i,player);
+          if(cnt>3)score-=(cnt-3)*2;
+        }
+        // Bearing off bonus
+        score+=state.off[player]*12;
+        score-=state.off[opp]*12;
+      } else {
+        // Contact game — pip count matters less
+        score+=(oppPip-myPip)*0.4;
+        score+=state.off[player]*15;
+        score-=state.off[opp]*15;
+      }
+
+      // ─── Bar penalty (very costly) ───
+      score-=state.bar[player]*25;
+      score+=state.bar[opp]*18;
+
+      // ─── Blot danger (using actual hit probability) ───
+      for(let i=0;i<24;i++){
+        if(player===0&&state.board[i]===1){
+          const prob=hitProbability(state.board,i,0);
+          // Weight by position: blots in opponent's home are much worse
+          let posWeight=1.0;
+          if(i>=18)posWeight=2.5;       // in opponent's home board
+          else if(i>=12)posWeight=1.8;  // in opponent's outer board
+          else if(i>=6)posWeight=1.2;   // in our outer board
+          else posWeight=0.8;           // in our home board (less dangerous)
+          score-=prob*posWeight*20;
+        }else if(player===1&&state.board[i]===-1){
+          const prob=hitProbability(state.board,i,1);
+          let posWeight=1.0;
+          if(i<=5)posWeight=2.5;
+          else if(i<=11)posWeight=1.8;
+          else if(i<=17)posWeight=1.2;
+          else posWeight=0.8;
+          score-=prob*posWeight*20;
+        }
+      }
+
+      // ─── Prime detection ───
+      let consecutive=0,bestPrime=0,primeStart=-1;
+      for(let i=0;i<24;i++){
+        if(countAt(state.board,i,player)>=2){
+          consecutive++;
+          if(consecutive>bestPrime){bestPrime=consecutive;primeStart=i-consecutive+1}
+        }else consecutive=0;
+      }
+      // Primes are worth exponentially more as they grow
+      if(bestPrime>=2)score+=bestPrime*bestPrime*4;
+      // A prime trapping opponent checkers is much more valuable
+      if(bestPrime>=3){
+        let trapped=0;
+        for(let i=0;i<24;i++){
+          if(countAt(state.board,i,opp)>0){
+            // Check if this checker is behind the prime
+            if(player===0&&i>primeStart+bestPrime-1)trapped+=countAt(state.board,i,opp);
+            if(player===1&&i<primeStart)trapped+=countAt(state.board,i,opp);
+          }
+        }
+        score+=trapped*bestPrime*2;
+      }
+
+      // ─── Home board points (crucial for containing hit checkers) ───
+      let homePoints=0;
+      if(player===0){for(let i=0;i<6;i++)if(state.board[i]>=2)homePoints++}
+      else{for(let i=18;i<24;i++)if(state.board[i]<=-2)homePoints++}
+      // Home board value increases when opponent is on bar or has blots
+      const oppOnBar=state.bar[opp]>0;
+      const homeMultiplier=oppOnBar?8:5;
+      score+=homePoints*homeMultiplier;
+      // Closed board bonus (all 6 home points)
+      if(homePoints===6)score+=20;
+
+      // ─── Anchors in opponent's home ───
+      let anchors=[];
+      if(player===0){for(let i=18;i<24;i++)if(state.board[i]>=2)anchors.push(i)}
+      else{for(let i=0;i<6;i++)if(state.board[i]<=-2)anchors.push(i)}
+      // Higher anchors are better (closer to opponent's bar point)
+      for(const a of anchors){
+        const anchorVal=player===0?(a-17):6-a; // 1-6, higher is better
+        score+=anchorVal*3;
+      }
+
+      // ─── Stacking penalty (too many on one point is wasteful) ───
+      for(let i=0;i<24;i++){
+        const cnt=countAt(state.board,i,player);
+        if(cnt>3)score-=(cnt-3)*3;
+        if(cnt>5)score-=(cnt-5)*5; // severe penalty for heavy stacking
+      }
+
+      // ─── Builder distribution (having spare checkers on useful points) ───
+      if(!isRace){
+        // Value builders (3rd checker on a point) near home board
+        if(player===0){
+          for(let i=4;i<12;i++){
+            const cnt=state.board[i];
+            if(cnt===3)score+=2; // good builder
+          }
+        }else{
+          for(let i=12;i<20;i++){
+            const cnt=-state.board[i];
+            if(cnt===3)score+=2;
+          }
+        }
+      }
+
+      // ─── Timing (in contact game, don't waste pips without purpose) ───
+      if(contact&&!inHome){
+        // Penalize having all checkers bunched on low points while opponent is still behind
+        let behindCount=0;
+        if(player===0){for(let i=6;i<24;i++)if(state.board[i]>0)behindCount+=state.board[i]}
+        else{for(let i=0;i<18;i++)if(state.board[i]<0)behindCount+=(-state.board[i])}
+        if(behindCount<=2&&!inHome){
+          // We're running out of timing — penalize slightly
+          score-=3;
+        }
+      }
+
+      return score;
+    }
+
+    /* ─── Training Analysis ─── */
+    function analyzeMoves(state,dice,player){
+      const allMoves=generateMoves(state,dice,player);
+      if(allMoves.length===0)return{moves:[],best:null,confidence:null,isOpening:false};
+
+      // Check for hardcoded opening move
+      const isOpening=player===0&&isOpeningPosition(state);
+      let openingMove=null;
+      if(isOpening){
+        openingMove=getOpeningMove(dice);
+      }
+
+      const scored=allMoves.map((m,idx)=>{
+        const sc=evaluateStateV2(m.state,player);
+        const tags=[];
+        // Check for hits
+        const hits=m.moves.filter(mv=>mv.to>=0&&mv.to<24&&(
+          (player===0&&state.board[mv.to]===-1)||(player===1&&state.board[mv.to]===1)
+        ));
+        if(hits.length>0)tags.push({label:'HIT',color:'#e74c3c',bg:'#3a1818'});
+        // Check for bear offs
+        if(m.moves.some(mv=>mv.to===-2||mv.to===25))tags.push({label:'BEAR OFF',color:'#f0c040',bg:'#3a3018'});
+        // Check prime building
+        let con=0,best=0;
+        for(let i=0;i<24;i++){if(countAt(m.state.board,i,player)>=2){con++;if(con>best)best=con}else con=0}
+        let oldCon=0,oldBest=0;
+        for(let i=0;i<24;i++){if(countAt(state.board,i,player)>=2){oldCon++;if(oldCon>oldBest)oldBest=oldCon}else oldCon=0}
+        if(best>oldBest&&best>=3)tags.push({label:'PRIME',color:'#9b59b6',bg:'#2a1830'});
+        // Blot exposure
+        let blots=0;
+        for(let i=0;i<24;i++){
+          if(player===0&&m.state.board[i]===1)blots++;
+          if(player===1&&m.state.board[i]===-1)blots++;
+        }
+        let oldBlots=0;
+        for(let i=0;i<24;i++){
+          if(player===0&&state.board[i]===1)oldBlots++;
+          if(player===1&&state.board[i]===-1)oldBlots++;
+        }
+        if(blots>oldBlots)tags.push({label:'BLOT',color:'#e67e22',bg:'#302010'});
+        if(blots<oldBlots)tags.push({label:'SAFE',color:'#27ae60',bg:'#1a3018'});
+        // Home board improvement
+        let hp=0,ohp=0;
+        if(player===0){for(let i=0;i<6;i++){if(m.state.board[i]>=2)hp++;if(state.board[i]>=2)ohp++}}
+        if(hp>ohp)tags.push({label:'ANCHOR',color:'#3498db',bg:'#182a38'});
+        // Slot
+        const slots=m.moves.filter(mv=>mv.to>=0&&mv.to<24&&countAt(m.state.board,mv.to,player)===1);
+        if(slots.length>0&&tags.every(t=>t.label!=='BLOT'))tags.push({label:'SLOT',color:'#8e44ad',bg:'#281830'});
+
+        // Check if this matches the opening book move
+        let isBookMove=false;
+        if(openingMove){
+          // Compare move destinations — the book move and this candidate
+          const bookSet=openingMove.map(bm=>bm.from+'>'+bm.to).sort().join(',');
+          const thisSet=m.moves.map(mv=>mv.from+'>'+mv.to).sort().join(',');
+          if(bookSet===thisSet)isBookMove=true;
+        }
+        if(isBookMove)tags.unshift({label:'BOOK',color:'#f0c040',bg:'#3a3018'});
+
+        return{...m,score:sc,tags,idx,isBookMove};
+      });
+      scored.sort((a,b)=>b.score-a.score);
+
+      // If opening book move exists, force it to be the best recommendation
+      if(openingMove){
+        const bookIdx=scored.findIndex(s=>s.isBookMove);
+        if(bookIdx>0){
+          const bookMove=scored.splice(bookIdx,1)[0];
+          scored.unshift(bookMove);
+        }
+      }
+
+      // Confidence calculation
+      let confidence=null;
+      if(scored.length>=2){
+        const gap=scored[0].score-scored[1].score;
+        const maxScore=Math.max(Math.abs(scored[0].score),1);
+        const relGap=gap/maxScore;
+        if(isOpening&&scored[0].isBookMove){
+          confidence={level:'high',label:'Book Move',color:'#f0c040',
+            detail:'Established best play per computer rollout analysis'};
+        }else if(relGap>0.15||gap>15){
+          confidence={level:'high',label:'Clear Best',color:'#27ae60',
+            detail:'Best move leads by '+Math.round(gap)+' points'};
+        }else if(relGap>0.05||gap>5){
+          confidence={level:'medium',label:'Slight Edge',color:'#e67e22',
+            detail:'Top moves differ by only '+Math.round(gap)+' points'};
+        }else{
+          confidence={level:'low',label:'Close Call',color:'#e74c3c',
+            detail:'Several moves score nearly equal (gap: '+Math.round(gap)+')'};
+        }
+      }else if(scored.length===1){
+        confidence={level:'high',label:'Only Move',color:'#27ae60',detail:'Only one legal move available'};
+      }
+
+      return{moves:scored,best:scored[0],confidence,isOpening};
+    }
+
+    function getStrategyTip(analysis){
+      if(!analysis.best)return'No legal moves available.';
+      const b=analysis.best;
+      const tags=b.tags.map(t=>t.label);
+      if(tags.includes('BOOK')){
+        // Give opening-specific advice
+        const moves=b.moves;
+        const makePoint=moves.length===2&&moves[0].to===moves[1].to;
+        if(makePoint){
+          const ptName=moves[0].to+1;
+          return'Book move: Make the '+ptName+'-point. Establishing key points early is fundamental.';
+        }
+        if(moves.length===1&&moves[0].from===23)return'Book move: Run a back checker. Escape while you can!';
+        return'Book move: Split and build — develop both sides of your position.';
+      }
+      if(tags.includes('BEAR OFF'))return'Bearing off checkers — keep the momentum going!';
+      if(tags.includes('HIT')&&tags.includes('PRIME'))return'Hit and extend your prime — excellent combination!';
+      if(tags.includes('HIT'))return'Hitting sends the opponent to the bar, costing them tempo.';
+      if(tags.includes('PRIME'))return'Building a prime blocks the opponent\'s movement.';
+      if(tags.includes('ANCHOR'))return'Strengthening your home board — key for trapping opponents.';
+      if(tags.includes('SAFE'))return'Reducing blot exposure — solid defensive play.';
+      if(tags.includes('BLOT'))return'This leaves a blot exposed — but it\'s the best option available.';
+      if(tags.includes('SLOT'))return'Slotting a point — risky but sets up for making the point.';
+      return'Advance your position with the best available move.';
+    }
+
+    /* ─── Main App Component ─── */
+    function App(){
+      const[,forceUpdate]=useState(0);
+      const tick=useCallback(()=>forceUpdate(n=>n+1),[]);
+      const g=useRef({
+        phase:P.MENU,
+        difficulty:'sharp',
+        matchLength:5,
+        training:false,
+        gameMode:'match',
+        // game state
+        state:initState(),
+        dice:[],
+        diceUsed:[],
+        currentPlayer:0,
+        selected:null, // point index or -1 for bar
+        validDests:[],
+        turnMoves:[], // moves made this turn
+        turnStates:[], // states for undo
+        remainingDice:[],
+        allLegalMoves:[],
+        destLabels:{},// die labels per destination point
+        // match state
+        matchScore:[0,0],
+        cubeValue:1,
+        cubeOwner:-1, // -1=center, 0=player, 1=cpu
+        crawford:false,
+        crawfordUsed:false,
+        // training
+        analysis:null,
+        // message
+        message:'',
+        // history
+        history:[],
+        // animation
+        animating:false,
+        diceAnim:false,
+        lastMovedTo:null,
+      }).current;
+
+      const workerRef=useRef(null);
+      useEffect(()=>{
+        const blob=new Blob([document.getElementById('ai-worker').textContent],{type:'application/javascript'});
+        workerRef.current=new Worker(URL.createObjectURL(blob));
+        return()=>workerRef.current&&workerRef.current.terminate();
+      },[]);
+
+      function safeTimeout(fn,ms){setTimeout(()=>{fn();tick()},ms)}
+
+      /* ─── Dice ─── */
+      function rollDice(){
+        return[Math.floor(Math.random()*6)+1,Math.floor(Math.random()*6)+1];
+      }
+      function getDiceList(d){
+        return d[0]===d[1]?[d[0],d[0],d[0],d[0]]:[d[0],d[1]];
+      }
+
+      /* ─── Game Flow ─── */
+      function startGame(){
+        g.state=initState();g.dice=[];g.turnMoves=[];g.turnStates=[];
+        g.matchScore=[0,0];g.cubeValue=1;g.cubeOwner=-1;
+        g.crawford=false;g.crawfordUsed=false;
+        g.history=[];g.analysis=null;g.selected=null;g.message='';
+        g.lastMovedTo=null;g.animating=false;
+        startNewGame();
+      }
+      function startNewGame(){
+        g.state=initState();g.dice=[];g.turnMoves=[];g.turnStates=[];
+        g.cubeValue=g.crawfordUsed&&!g.crawford?1:g.cubeValue;
+        if(!g.crawfordUsed)g.cubeValue=1;
+        g.cubeOwner=-1;g.cubeValue=1;
+        g.selected=null;g.analysis=null;g.message='';g.lastMovedTo=null;
+        // opening roll
+        doOpeningRoll();
+      }
+      function doOpeningRoll(){
+        g.phase=P.ROLLING;g.diceAnim=true;tick();
+        safeTimeout(()=>{
+          let d=rollDice();
+          while(d[0]===d[1])d=rollDice();
+          g.dice=d;g.diceAnim=false;
+          sfxRoll();
+          if(d[0]>d[1]){
+            g.currentPlayer=0;g.message='You won the opening roll!';
+            g.remainingDice=getDiceList(d);
+            beginPlayerTurn();
+          }else{
+            g.currentPlayer=1;g.message='CPU won the opening roll.';
+            g.remainingDice=getDiceList(d);
+            safeTimeout(()=>doCpuTurn(),800);
+          }
+          tick();
+        },700);
+      }
+      function beginPlayerTurn(){
+        g.phase=P.MOVING;g.turnMoves=[];g.turnStates=[cloneState(g.state)];
+        g.allLegalMoves=generateMoves(g.state,g.remainingDice,0);
+        if(g.training)g.analysis=analyzeMoves(g.state,g.remainingDice,0);
+        if(g.allLegalMoves.length===0){
+          g.message='No legal moves — turn passes.';
+          g.phase=P.MOVING;tick();
+          safeTimeout(()=>endTurn(),1200);
+          return;
+        }
+        if(g.allLegalMoves.length===1&&g.allLegalMoves[0].moves.length===g.remainingDice.length){
+          // auto-play forced move
+          g.message='Forced move.';tick();
+          const forced=g.allLegalMoves[0];
+          animateSequence(forced.moves,0,()=>{
+            g.state=forced.state;g.remainingDice=[];g.turnMoves=forced.moves;
+            addHistory(0,g.dice,forced.moves);
+            g.selected=null;tick();
+            safeTimeout(()=>endTurn(),400);
+          });
+          return;
+        }
+        g.selected=null;g.message='Your turn — select a checker to move.';tick();
+      }
+
+      function animateSequence(moves,idx,cb){
+        if(idx>=moves.length){cb();return}
+        const mv=moves[idx];
+        g.lastMovedTo=mv.to;g.animating=true;tick();
+        if(mv.to>=0&&mv.to<24){
+          const wasHit=(g.currentPlayer===0&&g.state.board[mv.to]===-1)||(g.currentPlayer===1&&g.state.board[mv.to]===1);
+          if(wasHit)sfxHit();else sfxPlace();
+        }else{sfxBearOff()}
+        g.state=applyMove(g.state,mv.from,mv.to,g.currentPlayer);
+        safeTimeout(()=>{g.animating=false;animateSequence(moves,idx+1,cb)},280);
+      }
+
+      /* ─── Player Interaction ─── */
+      function handlePointClick(pt){
+        if(g.phase!==P.MOVING||g.currentPlayer!==0||g.animating)return;
+        // If we have a selected checker, try to move there
+        if(g.selected!==null){
+          const dest=pt;
+          // Check if this is a valid destination
+          if(g.validDests.includes(dest)){
+            executePlayerMove(g.selected,dest);
+            return;
+          }
+          // Clicking same point deselects
+          if(g.selected===pt){g.selected=null;g.validDests=[];g.destLabels={};tick();return}
+        }
+        // Try to select this point
+        if(g.state.board[pt]>0){
+          selectChecker(pt);
+        }else{
+          g.selected=null;g.validDests=[];g.destLabels={};tick();
+        }
+      }
+      function handleBarClick(){
+        if(g.phase!==P.MOVING||g.currentPlayer!==0||g.animating)return;
+        if(g.state.bar[0]>0)selectChecker(-1);
+      }
+      function handleBearOffClick(){
+        if(g.phase!==P.MOVING||g.currentPlayer!==0||g.animating)return;
+        if(g.selected!==null&&g.validDests.includes(-2)){
+          executePlayerMove(g.selected,-2);
+        }
+      }
+      function selectChecker(pt){
+        g.selected=pt;
+        // Find valid destinations with die labels
+        // destsMap: dest -> array of {die, combo, mid} objects
+        const destsMap={};
+        function addDest(dest,info){
+          const k=dest;
+          if(!destsMap[k])destsMap[k]=[];
+          // avoid duplicate labels
+          const label=info.combo||String(info.die);
+          if(!destsMap[k].some(d=>(d.combo||String(d.die))===label))destsMap[k].push(info);
+        }
+        // Single die moves
+        for(const die of [...new Set(g.remainingDice)]){
+          let target;
+          if(pt===-1){target=24-die}
+          else{target=pt-die}
+          if(target>=0&&target<24&&canLand(g.state.board,target,0)){
+            addDest(target,{die,combo:null,mid:null});
+          }else if(target<0&&allInHome(g.state,0)){
+            if(target===-1||pt>=highestOccupied(g.state,0)){
+              addDest(-2,{die,combo:null,mid:null});
+            }
+          }
+        }
+        // Combined moves: use one die then the other from the landing spot
+        if(g.remainingDice.length>=2){
+          const uniqueDice=[...new Set(g.remainingDice)];
+          for(const die1 of uniqueDice){
+            let mid;
+            if(pt===-1){mid=24-die1}else{mid=pt-die1}
+            if(mid>=0&&mid<24&&canLand(g.state.board,mid,0)){
+              const tempState=applyMove(g.state,pt===-1?-1:pt,mid,0);
+              const remainAfter=[...g.remainingDice];
+              remainAfter.splice(remainAfter.indexOf(die1),1);
+              for(const die2 of [...new Set(remainAfter)]){
+                let target2=mid-die2;
+                if(target2>=0&&target2<24&&canLand(tempState.board,target2,0)){
+                  addDest(target2,{die:null,combo:die1+'+'+die2,mid,dies:[die1,die2]});
+                }else if(target2<0&&allInHome(tempState,0)){
+                  if(target2===-1||mid>=highestOccupied(tempState,0)){
+                    addDest(-2,{die:null,combo:die1+'+'+die2,mid,dies:[die1,die2]});
+                  }
+                }
+              }
+            }
+          }
+        }
+        g.validDests=Object.keys(destsMap).map(Number);
+        g.destLabels=destsMap;
+        if(g.validDests.length===0){g.message='No moves for this checker.';g.selected=null;g.destLabels={}}
+        else{g.message='Select destination.'}
+        tick();
+      }
+      function executePlayerMove(from,to){
+        // Check if this is a combo move or single die move
+        const labels=g.destLabels&&g.destLabels[to]?g.destLabels[to]:[];
+        const dist=from===-1?24-to:from-to;
+        // Try to find a single-die move first
+        let singleMove=labels.find(l=>!l.combo&&g.remainingDice.includes(l.die));
+        // For bear-off, also check oversize dice
+        if(!singleMove&&to===-2){
+          const exact=from+1;
+          singleMove=labels.find(l=>!l.combo);
+          if(singleMove){
+            // find the actual die to use
+            if(g.remainingDice.includes(exact)){singleMove={die:exact,combo:null,mid:null}}
+            else{
+              const sorted=[...g.remainingDice].sort((a,b)=>a-b);
+              for(const d of sorted){if(d>=exact){singleMove={die:d,combo:null,mid:null};break}}
+            }
+          }
+        }
+        // If single die matches the distance, use it
+        if(singleMove&&!singleMove.combo){
+          const usedDie=singleMove.die;
+          if(!g.remainingDice.includes(usedDie)){
+            g.message='Invalid move.';g.selected=null;g.validDests=[];g.destLabels={};tick();return;
+          }
+          g.turnStates.push(cloneState(g.state));
+          const wasHit=(to>=0&&to<24&&g.state.board[to]===-1);
+          g.state=applyMove(g.state,from,to,0);
+          g.lastMovedTo=to;
+          g.remainingDice.splice(g.remainingDice.indexOf(usedDie),1);
+          g.turnMoves.push({from,to,die:usedDie});
+          if(wasHit)sfxHit();else if(to===-2)sfxBearOff();else sfxPlace();
+          g.selected=null;g.validDests=[];g.destLabels={};
+          afterPlayerMove();
+          return;
+        }
+        // Otherwise try combo move — animate hop through intermediate
+        const comboMove=labels.find(l=>l.combo);
+        if(comboMove&&comboMove.dies&&comboMove.mid!=null){
+          const die1=comboMove.dies[0];const die2=comboMove.dies[1];
+          const mid=comboMove.mid;
+          g.turnStates.push(cloneState(g.state));
+          // First hop: from -> mid
+          const wasHit1=(mid>=0&&mid<24&&g.state.board[mid]===-1);
+          g.state=applyMove(g.state,from,mid,0);
+          g.lastMovedTo=mid;
+          g.remainingDice.splice(g.remainingDice.indexOf(die1),1);
+          g.turnMoves.push({from,to:mid,die:die1});
+          if(wasHit1)sfxHit();else sfxPlace();
+          g.animating=true;tick();
+          // Second hop after delay: mid -> to
+          safeTimeout(()=>{
+            g.turnStates.push(cloneState(g.state));
+            const wasHit2=(to>=0&&to<24&&g.state.board[to]===-1);
+            g.state=applyMove(g.state,mid,to,0);
+            g.lastMovedTo=to;
+            g.remainingDice.splice(g.remainingDice.indexOf(die2),1);
+            g.turnMoves.push({from:mid,to,die:die2});
+            if(wasHit2)sfxHit();else if(to===-2)sfxBearOff();else sfxPlace();
+            g.animating=false;
+            g.selected=null;g.validDests=[];g.destLabels={};
+            afterPlayerMove();
+          },300);
+          return;
+        }
+        // Fallback: try raw distance match
+        const usedDie=dist;
+        if(g.remainingDice.includes(usedDie)){
+          g.turnStates.push(cloneState(g.state));
+          const wasHit=(to>=0&&to<24&&g.state.board[to]===-1);
+          g.state=applyMove(g.state,from,to,0);
+          g.lastMovedTo=to;
+          g.remainingDice.splice(g.remainingDice.indexOf(usedDie),1);
+          g.turnMoves.push({from,to,die:usedDie});
+          if(wasHit)sfxHit();else if(to===-2)sfxBearOff();else sfxPlace();
+          g.selected=null;g.validDests=[];g.destLabels={};
+          afterPlayerMove();
+          return;
+        }
+        g.message='Invalid move.';g.selected=null;g.validDests=[];g.destLabels={};tick();
+      }
+      function afterPlayerMove(){
+        if(g.remainingDice.length>0){
+          g.allLegalMoves=generateMoves(g.state,g.remainingDice,0);
+          if(g.training)g.analysis=analyzeMoves(g.state,g.remainingDice,0);
+          if(g.allLegalMoves.length===0){
+            g.message='No more legal moves.';
+            addHistory(0,g.dice,g.turnMoves);
+            tick();
+            safeTimeout(()=>endTurn(),800);
+            return;
+          }
+          g.message='Continue moving.';tick();
+        }else{
+          addHistory(0,g.dice,g.turnMoves);
+          endTurn();
+        }
+      }
+      function undoLastMove(){
+        if(g.turnMoves.length===0||g.phase!==P.MOVING)return;
+        const lastMove=g.turnMoves.pop();
+        g.remainingDice.push(lastMove.die);
+        g.state=g.turnStates.pop();
+        g.selected=null;g.validDests=[];g.destLabels={};
+        g.allLegalMoves=generateMoves(g.state,g.remainingDice,0);
+        if(g.training)g.analysis=analyzeMoves(g.state,g.remainingDice,0);
+        g.message='Move undone.';tick();
+      }
+
+      function endTurn(){
+        // Check for win
+        if(g.state.off[g.currentPlayer]>=15){
+          handleWin(g.currentPlayer);return;
+        }
+        // Switch player
+        g.currentPlayer=1-g.currentPlayer;
+        g.selected=null;g.validDests=[];g.destLabels={};g.turnMoves=[];g.analysis=null;
+        if(g.currentPlayer===1){
+          // CPU doubling check
+          if(g.gameMode==='match'&&!g.crawford&&g.cubeOwner!==0){
+            // simple doubling logic: double if strong advantage
+            const myPip=pipCount(g.state,1);const oppPip=pipCount(g.state,0);
+            if(oppPip>myPip*1.15&&g.cubeValue<64&&Math.random()<0.3){
+              g.phase=P.DOUBLING;g.message='CPU offers to double!';sfxDouble();tick();
+              return;
+            }
+          }
+          g.phase=P.CPU_ROLLING;g.message='CPU rolling...';g.diceAnim=true;tick();
+          safeTimeout(()=>{
+            g.dice=rollDice();g.diceAnim=false;g.remainingDice=getDiceList(g.dice);
+            sfxRoll();g.message='CPU thinking...';tick();
+            safeTimeout(()=>doCpuTurn(),600);
+          },600);
+        }else{
+          // Player turn — roll
+          if(g.gameMode==='match'&&!g.crawford&&g.cubeOwner!==1){
+            // player could double — show option
+          }
+          g.phase=P.ROLLING;g.message='Your turn — click Roll.';tick();
+        }
+      }
+      function handlePlayerRoll(){
+        if(g.phase!==P.ROLLING||g.currentPlayer!==0)return;
+        g.diceAnim=true;tick();
+        safeTimeout(()=>{
+          g.dice=rollDice();g.diceAnim=false;g.remainingDice=getDiceList(g.dice);
+          sfxRoll();beginPlayerTurn();
+        },500);
+      }
+      function handlePlayerDouble(){
+        if(g.gameMode!=='match'||g.crawford)return;
+        g.phase=P.DOUBLING;g.message='You offer to double!';sfxDouble();tick();
+        // CPU accepts/declines
+        safeTimeout(()=>{
+          const myPip=pipCount(g.state,0);const cpuPip=pipCount(g.state,1);
+          const accept=cpuPip<=myPip*1.3;
+          if(accept){
+            g.cubeValue*=2;g.cubeOwner=1;
+            g.message='CPU accepts the double. Cube at '+g.cubeValue+'.';
+            g.phase=P.ROLLING;tick();
+          }else{
+            g.message='CPU declines — you win this game!';
+            scoreGame(0,false);
+          }
+        },1000);
+      }
+      function handleDoubleResponse(accept){
+        if(accept){
+          g.cubeValue*=2;g.cubeOwner=0;
+          g.message='You accept. Cube at '+g.cubeValue+'.';tick();
+          safeTimeout(()=>{
+            g.phase=P.CPU_ROLLING;g.message='CPU rolling...';g.diceAnim=true;tick();
+            safeTimeout(()=>{
+              g.dice=rollDice();g.diceAnim=false;g.remainingDice=getDiceList(g.dice);
+              sfxRoll();g.message='CPU thinking...';tick();
+              safeTimeout(()=>doCpuTurn(),600);
+            },600);
+          },600);
+        }else{
+          g.message='You decline — CPU wins this game.';
+          scoreGame(1,false);
+        }
+      }
+
+      function doCpuTurn(){
+        g.phase=P.CPU_TURN;
+        const worker=workerRef.current;
+        if(!worker){
+          // fallback
+          endTurn();return;
+        }
+        worker.onmessage=(e)=>{
+          const{moves,state:finalState}=e.data;
+          if(moves.length===0){
+            g.message='CPU has no legal moves.';tick();
+            safeTimeout(()=>endTurn(),800);
+            return;
+          }
+          // Animate CPU moves
+          const movesToAnimate=moves;
+          let i=0;
+          function nextCpuMove(){
+            if(i>=movesToAnimate.length){
+              g.state=finalState;
+              addHistory(1,g.dice,movesToAnimate);
+              tick();
+              safeTimeout(()=>endTurn(),300);
+              return;
+            }
+            const mv=movesToAnimate[i];
+            g.lastMovedTo=mv.to;
+            const wasHit=(mv.to>=0&&mv.to<24&&(
+              (g.state.board[mv.to]===1)
+            ));
+            g.state=applyMove(g.state,mv.from,mv.to,1);
+            if(wasHit)sfxHit();else if(mv.to===25)sfxBearOff();else sfxPlace();
+            i++;tick();
+            safeTimeout(nextCpuMove,300);
+          }
+          nextCpuMove();
+        };
+        worker.postMessage({state:g.state,dice:g.remainingDice,player:1,difficulty:g.difficulty});
+      }
+
+      function handleWin(player){
+        const opp=1-player;
+        // Determine gammon/backgammon
+        let mult=1;
+        let winType='single';
+        if(g.state.off[opp]===0){
+          mult=2;winType='gammon';
+          // backgammon: opponent has checkers on bar or in winner's home
+          if(player===0&&(g.state.bar[1]>0||(()=>{for(let i=0;i<6;i++)if(g.state.board[i]<0)return true;return false})())){
+            mult=3;winType='backgammon';
+          }
+          if(player===1&&(g.state.bar[0]>0||(()=>{for(let i=18;i<24;i++)if(g.state.board[i]>0)return true;return false})())){
+            mult=3;winType='backgammon';
+          }
+        }
+        const points=mult*g.cubeValue;
+        if(player===0)sfxWin();else sfxLose();
+        if(g.gameMode==='match'){
+          g.matchScore[player]+=points;
+          // Crawford check
+          if(!g.crawfordUsed){
+            if(g.matchScore[0]>=g.matchLength-1||g.matchScore[1]>=g.matchLength-1){
+              g.crawford=true;g.crawfordUsed=true;
+            }
+          }else{g.crawford=false}
+          if(g.matchScore[player]>=g.matchLength){
+            g.phase=P.GAME_OVER;
+            g.message=player===0?`You win the match ${g.matchScore[0]}-${g.matchScore[1]}!`:`CPU wins the match ${g.matchScore[1]}-${g.matchScore[0]}.`;
+            tick();return;
+          }
+          g.phase=P.BETWEEN_GAMES;
+          g.message=`${player===0?'You':' CPU'} win${player===0?'':'s'} a ${winType}! +${points} point${points>1?'s':''}. Score: ${g.matchScore[0]}-${g.matchScore[1]}`;
+          tick();
+        }else{
+          g.phase=P.GAME_OVER;
+          g.message=player===0?`You win with a ${winType}!`:`CPU wins with a ${winType}.`;
+          tick();
+        }
+      }
+      function scoreGame(winner,_){
+        const points=g.cubeValue;
+        if(g.gameMode==='match'){
+          g.matchScore[winner]+=points;
+          if(!g.crawfordUsed&&(g.matchScore[0]>=g.matchLength-1||g.matchScore[1]>=g.matchLength-1)){
+            g.crawford=true;g.crawfordUsed=true;
+          }else{g.crawford=false}
+          if(g.matchScore[winner]>=g.matchLength){
+            g.phase=P.GAME_OVER;
+            g.message=winner===0?`You win the match ${g.matchScore[0]}-${g.matchScore[1]}!`:`CPU wins the match ${g.matchScore[1]}-${g.matchScore[0]}.`;
+            tick();return;
+          }
+          g.phase=P.BETWEEN_GAMES;
+          g.message=`${winner===0?'You':'CPU'} win${winner===0?'':'s'}! Score: ${g.matchScore[0]}-${g.matchScore[1]}`;
+        }else{
+          g.phase=P.GAME_OVER;
+          g.message=winner===0?'You win!':'CPU wins.';
+        }
+        tick();
+      }
+      function addHistory(player,dice,moves){
+        const entry={player,dice:[...dice],moves:moves.map(m=>({...m})),timestamp:Date.now()};
+        g.history=[entry,...g.history].slice(0,12);
+      }
+
+      /* ─── Scaling ─── */
+      function getScale(){
+        if(typeof window==='undefined')return 1;
+        const w=window.innerWidth;
+        if(w>=600)return 1;
+        if(w<=360)return 0.6;
+        return 0.6+(w-360)/240*0.4;
+      }
+      const scale=getScale();
+
+      /* ─── Styles ─── */
+      const S={
+        bg:{minHeight:'100vh',background:'linear-gradient(145deg,#1a0e07 0%,#2d1810 50%,#1a0e07 100%)',fontFamily:"'Georgia','Times New Roman',serif",color:'#e8d5a3',display:'flex',flexDirection:'column',alignItems:'center',padding:'12px 8px',userSelect:'none'},
+        title:{fontSize:Math.min(44*scale,44)+'px',fontWeight:'bold',textShadow:'0 0 30px rgba(218,165,87,0.3),2px 2px 0 #5a3a20',letterSpacing:'3px',color:'#daa557',marginBottom:'8px'},
+        subtitle:{fontSize:12*scale+'px',color:'#8a7a5a',letterSpacing:'2px',marginBottom:'16px'},
+        btn:(active)=>({
+          padding:`${8*scale}px ${18*scale}px`,border:'none',borderRadius:'8px',cursor:'pointer',
+          fontFamily:"'Georgia',serif",fontSize:13*scale+'px',fontWeight:'bold',letterSpacing:'1px',
+          background:active?'linear-gradient(135deg,#c0952a,#daa557,#c0952a)':'rgba(90,58,32,0.5)',
+          color:active?'#1a0e07':'#e8d5a3',
+          boxShadow:active?'0 2px 8px rgba(218,165,87,0.3)':'none',
+          transition:'all 0.15s',
+        }),
+        panel:{background:'rgba(42,26,14,0.85)',border:'1px solid #5a3a20',borderRadius:'12px',padding:16*scale+'px',marginBottom:'12px'},
+        board:{
+          position:'relative',
+          width:Math.min(520,520*scale)+'px',
+          background:'radial-gradient(ellipse at center,#5a3a20 0%,#3a2210 60%,#2a1808 100%)',
+          border:'3px solid #6b4a2a',borderRadius:'10px',
+          boxShadow:'inset 0 0 30px rgba(0,0,0,0.5),0 4px 20px rgba(0,0,0,0.6)',
+          padding:'8px',
+        },
+      };
+
+      /* ─── Board Rendering ─── */
+      const BOARD_W=Math.min(504,504*scale);
+      const POINT_W=BOARD_W/14; // 12 points + bar + padding
+      const CHECKER_SIZE=Math.min(34,34*scale);
+      const POINT_H=BOARD_W*0.35;
+
+      function PointTriangle({index,top}){
+        const dark=index%2===0;
+        const color=dark?'#5a3018':'#c8a870';
+        const w=POINT_W;const h=POINT_H;
+        return React.createElement('div',{style:{
+          width:0,height:0,
+          borderLeft:w/2+'px solid transparent',
+          borderRight:w/2+'px solid transparent',
+          [top?'borderTop':'borderBottom']:h+'px solid '+color,
+          position:'absolute',
+          [top?'top':'bottom']:'0',
+          left:getPointX(index)+'px',
+          opacity:0.7,zIndex:0,
+        }});
+      }
+
+      function getPointX(idx){
+        // Points 23-18 = top-left (indices 0-5 visually), 17-12 = top-right (7-12)
+        // Points 0-5 = bottom-right, 6-11 = bottom-left
+        // Layout: top row: 12(right)→13...→23(left) then bottom row: 11(left)→10...→0(right)
+        // Actually let's use standard backgammon layout:
+        // Top: points 13,14,15,16,17,18 | BAR | 19,20,21,22,23,24
+        // Bot: points 12,11,10,9,8,7    | BAR | 6,5,4,3,2,1
+        // But our indices are 0-23 where 0=player's 1-point
+        // So: Top row (CPU home→outer): idx 12,13,14,15,16,17 | BAR | 18,19,20,21,22,23
+        //     Bot row (player home→outer): idx 11,10,9,8,7,6 | BAR | 5,4,3,2,1,0
+        let col;
+        if(idx>=12){
+          // top row
+          const topIdx=idx-12; // 0-11
+          if(topIdx<6)col=topIdx;
+          else col=topIdx+1; // skip bar column
+        }else{
+          // bottom row
+          const botIdx=11-idx; // 0=pt11, 11=pt0
+          if(botIdx<6)col=botIdx;
+          else col=botIdx+1;
+        }
+        return col*POINT_W+4;
+      }
+      function isTopPoint(idx){return idx>=12}
+
+      // Compute training best-move highlights
+      function getTrainingHighlights(){
+        if(!g.training||!g.analysis||!g.analysis.best)return{sources:new Set(),dests:new Set()};
+        const sources=new Set();const dests=new Set();
+        for(const mv of g.analysis.best.moves){
+          if(mv.from>=0)sources.add(mv.from);
+          if(mv.to>=0&&mv.to<24)dests.add(mv.to);
+        }
+        return{sources,dests};
+      }
+
+      function CheckerStack({point,onClick,isSelected,isValidDest,isLastMoved,isBestSource,isBestDest}){
+        const count=Math.abs(g.state.board[point]);
+        const isPlayer=g.state.board[point]>0;
+        if(count===0&&!isValidDest&&!isBestDest)return null;
+        const top=isTopPoint(point);
+        const x=getPointX(point);
+        const maxShow=Math.min(count,5);
+        const checkers=[];
+        for(let i=0;i<maxShow;i++){
+          checkers.push(React.createElement('div',{key:i,style:{
+            width:CHECKER_SIZE+'px',height:CHECKER_SIZE+'px',borderRadius:'50%',
+            background:isPlayer
+              ?'radial-gradient(circle at 35% 30%,#fff8e0,#daa557 40%,#b8862a 70%,#8a6420 100%)'
+              :'radial-gradient(circle at 35% 30%,#6a4a3a,#3a2218 40%,#2a1808 70%,#1a0e04 100%)',
+            border:isPlayer?'1.5px solid #c8a050':'1.5px solid #4a3020',
+            boxShadow:`inset -2px -2px 4px rgba(0,0,0,0.3),inset 1px 1px 2px rgba(255,255,255,${isPlayer?0.3:0.1}),0 1px 3px rgba(0,0,0,0.4)`,
+            position:'absolute',
+            left:'50%',transform:'translateX(-50%)',
+            [top?'top':'bottom']:(8+i*(CHECKER_SIZE*0.85))+'px',
+            zIndex:i+1,
+            animation:isLastMoved&&i===maxShow-1?'checkerMove 0.25s ease-out':'none',
+          }}));
+        }
+        // Highlight logic: selected > valid dest > training best
+        const highlight=isSelected?'0 0 14px rgba(240,192,64,0.8)'
+          :isValidDest?'0 0 12px rgba(96,192,96,0.7)'
+          :isBestSource?'0 0 10px rgba(96,220,96,0.5)'
+          :isBestDest?'0 0 10px rgba(96,220,96,0.4)'
+          :'none';
+        // Die label for valid destinations
+        const rawLabels=isValidDest&&g.destLabels&&g.destLabels[point]?g.destLabels[point]:null;
+        const dieLabels=rawLabels?rawLabels.map(l=>l.combo||String(l.die)):null;
+        // Best move badge for training
+        const showBest=(isBestSource||isBestDest)&&!isSelected&&!isValidDest;
+        return React.createElement('div',{
+          onClick:()=>onClick(point),
+          style:{
+            position:'absolute',left:x+'px',
+            [top?'top':'bottom']:'0',
+            width:POINT_W+'px',height:POINT_H+'px',
+            cursor:(isPlayer&&g.phase===P.MOVING&&g.currentPlayer===0)||isValidDest?'pointer':'default',
+            zIndex:isSelected||isValidDest?8:5,
+            boxShadow:highlight,borderRadius:'4px',
+          }
+        },
+          checkers,
+          count>5?React.createElement('div',{style:{
+            position:'absolute',left:'50%',transform:'translateX(-50%)',
+            [top?'top':'bottom']:(12+4*(CHECKER_SIZE*0.85))+'px',
+            fontSize:'10px',color:'#e8d5a3',background:'rgba(0,0,0,0.6)',
+            borderRadius:'8px',padding:'1px 5px',zIndex:10,
+          }},count):null,
+          // Die labels on valid destinations
+          dieLabels?React.createElement('div',{style:{
+            position:'absolute',left:'50%',transform:'translateX(-50%)',
+            [top?'bottom':'top']:'-2px',
+            display:'flex',gap:'2px',zIndex:12,
+          }},dieLabels.map((d,i)=>React.createElement('span',{key:i,style:{
+            fontSize:'9px',fontWeight:'bold',
+            color:typeof d==='string'?'#f0c040':'#e8d5a3',
+            background:typeof d==='string'?'rgba(180,140,40,0.25)':'rgba(60,140,60,0.3)',
+            border:'1px solid '+(typeof d==='string'?'rgba(240,192,64,0.5)':'rgba(96,192,96,0.5)'),
+            padding:'1px 4px',borderRadius:'3px',
+          }},d))):null,
+          // Training best move badge
+          showBest?React.createElement('div',{style:{
+            position:'absolute',left:'50%',transform:'translateX(-50%)',
+            [top?'bottom':'top']:'-2px',
+            fontSize:'8px',fontWeight:'bold',color:'#60c060',
+            background:'rgba(30,60,30,0.8)',border:'1px solid rgba(96,192,96,0.5)',
+            padding:'1px 5px',borderRadius:'3px',zIndex:12,letterSpacing:'1px',
+          }},isBestSource?'BEST':'→ HERE'):null,
+          // Point numbers in training mode
+          g.training?React.createElement('div',{style:{
+            position:'absolute',left:'50%',transform:'translateX(-50%)',
+            [top?'top':'bottom']:'-13px',
+            fontSize:'8px',color:'#6b4a2a',zIndex:10,
+          }},point+1):null,
+        );
+      }
+
+      function BarArea(){
+        const pBar=g.state.bar[0];const cBar=g.state.bar[1];
+        const barX=6*POINT_W+4;
+        return React.createElement('div',{style:{
+          position:'absolute',left:barX+'px',top:'0',bottom:'0',width:POINT_W+'px',
+          background:'linear-gradient(180deg,#2a1808,#3a2818,#2a1808)',
+          borderLeft:'1px solid #4a3020',borderRight:'1px solid #4a3020',
+          display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'space-between',
+          padding:'8px 0',zIndex:3,
+        }},
+          // CPU bar checkers (top)
+          React.createElement('div',{style:{display:'flex',flexDirection:'column',alignItems:'center',gap:'2px'}},
+            cBar>0?[...Array(Math.min(cBar,3))].map((_,i)=>React.createElement('div',{key:i,style:{
+              width:CHECKER_SIZE*0.8+'px',height:CHECKER_SIZE*0.8+'px',borderRadius:'50%',
+              background:'radial-gradient(circle at 35% 30%,#6a4a3a,#3a2218 40%,#2a1808 70%)',
+              border:'1px solid #4a3020',boxShadow:'0 1px 3px rgba(0,0,0,0.4)',
+            }})):null,
+            cBar>3?React.createElement('div',{style:{fontSize:'9px',color:'#e8d5a3'}},cBar):null,
+          ),
+          // Player bar checkers (bottom)
+          React.createElement('div',{
+            onClick:handleBarClick,
+            style:{display:'flex',flexDirection:'column',alignItems:'center',gap:'2px',cursor:pBar>0?'pointer':'default',
+              boxShadow:g.selected===-1?'0 0 12px rgba(240,192,64,0.7)':'none',borderRadius:'4px',padding:'4px',
+            }},
+            pBar>0?[...Array(Math.min(pBar,3))].map((_,i)=>React.createElement('div',{key:i,style:{
+              width:CHECKER_SIZE*0.8+'px',height:CHECKER_SIZE*0.8+'px',borderRadius:'50%',
+              background:'radial-gradient(circle at 35% 30%,#fff8e0,#daa557 40%,#b8862a 70%)',
+              border:'1px solid #c8a050',boxShadow:'0 1px 3px rgba(0,0,0,0.4)',
+            }})):null,
+            pBar>3?React.createElement('div',{style:{fontSize:'9px',color:'#e8d5a3'}},pBar):null,
+          ),
+        );
+      }
+
+      function BearOffTray({player}){
+        const count=g.state.off[player];
+        const isValidDest=player===0&&g.validDests.includes(-2);
+        const rawLabels=isValidDest&&g.destLabels&&g.destLabels[-2]?g.destLabels[-2]:null;
+        const dieLabels=rawLabels?rawLabels.map(l=>l.combo||String(l.die)):null;
+        const isBestBearOff=g.training&&g.analysis&&g.analysis.best&&g.analysis.best.moves.some(m=>m.to===-2||m.to===25)&&player===(g.analysis.best.moves[0].to===-2?0:1);
+        return React.createElement('div',{
+          onClick:player===0?handleBearOffClick:null,
+          style:{
+            width:POINT_W+'px',minHeight:POINT_H*1.5+'px',
+            background:'rgba(26,14,7,0.6)',border:'1px solid #4a3020',borderRadius:'6px',
+            display:'flex',flexDirection:'column',alignItems:'center',justifyContent:player===0?'flex-end':'flex-start',
+            padding:'4px 2px',cursor:isValidDest?'pointer':'default',
+            boxShadow:isValidDest?'0 0 10px rgba(96,192,96,0.6)':isBestBearOff?'0 0 8px rgba(96,220,96,0.4)':'none',
+            position:'relative',
+          }
+        },
+          [...Array(Math.min(count,10))].map((_,i)=>React.createElement('div',{key:i,style:{
+            width:CHECKER_SIZE*0.75+'px',height:CHECKER_SIZE*0.25+'px',borderRadius:'2px',
+            background:player===0
+              ?'linear-gradient(90deg,#b8862a,#daa557)'
+              :'linear-gradient(90deg,#2a1808,#4a3020)',
+            border:player===0?'1px solid #c8a050':'1px solid #3a2818',
+            marginBottom:'1px',
+          }})),
+          count>0?React.createElement('div',{style:{fontSize:'10px',color:'#e8d5a3',marginTop:'4px'}},count):null,
+          dieLabels?React.createElement('div',{style:{
+            position:'absolute',bottom:'-16px',left:'50%',transform:'translateX(-50%)',
+            display:'flex',gap:'2px',
+          }},dieLabels.map((d,i)=>React.createElement('span',{key:i,style:{
+            fontSize:'9px',fontWeight:'bold',
+            color:typeof d==='string'?'#f0c040':'#e8d5a3',
+            background:typeof d==='string'?'rgba(180,140,40,0.25)':'rgba(60,140,60,0.3)',
+            border:'1px solid '+(typeof d==='string'?'rgba(240,192,64,0.5)':'rgba(96,192,96,0.5)'),
+            padding:'1px 4px',borderRadius:'3px',
+          }},d))):null,
+        );
+      }
+
+      function Die({value,rolling}){
+        if(!value&&!rolling)return null;
+        const[animFace,setAnimFace]=useState(1);
+        useEffect(()=>{
+          if(!rolling)return;
+          const id=setInterval(()=>setAnimFace(Math.floor(Math.random()*6)+1),80);
+          return()=>clearInterval(id);
+        },[rolling]);
+        const face=rolling?animFace:value;
+        // Dot positions as percentages [left%, top%] for proper centering
+        const dotLayouts={
+          1:[[50,50]],
+          2:[[25,25],[75,75]],
+          3:[[25,25],[50,50],[75,75]],
+          4:[[25,25],[75,25],[25,75],[75,75]],
+          5:[[25,25],[75,25],[50,50],[25,75],[75,75]],
+          6:[[25,22],[75,22],[25,50],[75,50],[25,78],[75,78]],
+        };
+        const dots=dotLayouts[face]||[];
+        const sz=Math.min(44,44*scale);
+        const dotSz=Math.round(sz*0.17);
+        return React.createElement('div',{style:{
+          width:sz+'px',height:sz+'px',
+          background:'linear-gradient(145deg,#faf6ee,#e8e0d0,#d8d0c0)',
+          borderRadius:Math.round(sz*0.15)+'px',
+          border:'1px solid #b8a880',position:'relative',
+          boxShadow:'0 3px 8px rgba(0,0,0,0.5),inset 0 1px 0 rgba(255,255,255,0.6),inset 0 -1px 2px rgba(0,0,0,0.1)',
+          transform:rolling?'rotate('+(Math.random()*10-5)+'deg)':'none',
+          transition:rolling?'none':'transform 0.2s',
+        }},dots.map((p,i)=>React.createElement('div',{key:i,style:{
+          position:'absolute',
+          width:dotSz+'px',height:dotSz+'px',borderRadius:'50%',
+          background:'radial-gradient(circle at 40% 35%,#4a3828,#1a0e04)',
+          left:'calc('+p[0]+'% - '+dotSz/2+'px)',
+          top:'calc('+p[1]+'% - '+dotSz/2+'px)',
+          boxShadow:'inset 0 1px 1px rgba(0,0,0,0.3)',
+        }})));
+      }
+
+      function DoublingCube(){
+        if(g.gameMode!=='match')return null;
+        return React.createElement('div',{style:{
+          width:28*scale+'px',height:28*scale+'px',background:'linear-gradient(135deg,#f0f0f0,#d0d0d0)',
+          borderRadius:'4px',border:'1px solid #aaa',display:'flex',alignItems:'center',justifyContent:'center',
+          fontSize:12*scale+'px',fontWeight:'bold',color:'#333',
+          boxShadow:'0 1px 4px rgba(0,0,0,0.3)',
+        }},g.cubeValue);
+      }
+
+      /* ─── Render ─── */
+      // MENU
+      if(g.phase===P.MENU){
+        return React.createElement('div',{style:S.bg},
+          React.createElement('div',{style:{...S.title,marginTop:'30px'}},'BACKGAMMON'),
+          React.createElement('div',{style:S.subtitle},'CLASSIC STRATEGY'),
+          React.createElement('div',{style:{...S.panel,width:Math.min(380,380*scale)+'px',textAlign:'center'}},
+            // Difficulty
+            React.createElement('div',{style:{marginBottom:'16px'}},
+              React.createElement('div',{style:{fontSize:'11px',color:'#8a7a5a',letterSpacing:'2px',marginBottom:'8px'}},'DIFFICULTY'),
+              React.createElement('div',{style:{display:'flex',gap:'6px',justifyContent:'center'}},
+                ['rookie','sharp','master'].map(d=>
+                  React.createElement('button',{key:d,onClick:()=>{g.difficulty=d;tick()},style:{
+                    ...S.btn(g.difficulty===d),
+                    color:g.difficulty===d?'#1a0e07':d==='rookie'?'#e67e22':d==='sharp'?'#3498db':'#9b59b6',
+                  }},{rookie:'🎲 Rookie',sharp:'📊 Sharp',master:'🧠 Master'}[d])
+                )
+              ),
+            ),
+            // Game Mode
+            React.createElement('div',{style:{marginBottom:'16px'}},
+              React.createElement('div',{style:{fontSize:'11px',color:'#8a7a5a',letterSpacing:'2px',marginBottom:'8px'}},'GAME MODE'),
+              React.createElement('div',{style:{display:'flex',gap:'6px',justifyContent:'center'}},
+                ['single','match'].map(m=>
+                  React.createElement('button',{key:m,onClick:()=>{g.gameMode=m;tick()},style:S.btn(g.gameMode===m)},
+                    m==='single'?'Single Game':'Match Play')
+                )
+              ),
+            ),
+            // Match Length
+            g.gameMode==='match'?React.createElement('div',{style:{marginBottom:'16px'}},
+              React.createElement('div',{style:{fontSize:'11px',color:'#8a7a5a',letterSpacing:'2px',marginBottom:'8px'}},'MATCH LENGTH'),
+              React.createElement('div',{style:{display:'flex',gap:'6px',justifyContent:'center'}},
+                [1,3,5,7,11].map(n=>
+                  React.createElement('button',{key:n,onClick:()=>{g.matchLength=n;tick()},style:{
+                    ...S.btn(g.matchLength===n),fontSize:12*scale+'px',padding:`${6*scale}px ${12*scale}px`,
+                  }},n+' pt'+(n>1?'s':''))
+                )
+              ),
+            ):null,
+            // Training
+            React.createElement('div',{style:{marginBottom:'20px'}},
+              React.createElement('button',{onClick:()=>{g.training=!g.training;tick()},style:{
+                ...S.btn(g.training),
+                background:g.training?'linear-gradient(135deg,#2a6a3a,#3a8a4a)':'rgba(90,58,32,0.5)',
+                color:g.training?'#e8d5a3':'#8a7a5a',
+              }},'📖 Training Mode'),
+            ),
+            // Rules
+            React.createElement('div',{style:{fontSize:'10px',color:'#6b4a2a',lineHeight:'1.5',marginBottom:'16px',textAlign:'left',padding:'0 8px'}},
+              'Standard Backgammon rules. Move your 15 checkers around the board and bear them all off first. ',
+              'Roll dice, move checkers from higher to lower points. ',
+              'Land on a single opponent checker to send it to the bar. ',
+              g.gameMode==='match'?'Match play includes the doubling cube and Crawford rule.':'',
+            ),
+            // Play
+            React.createElement('button',{onClick:startGame,style:{
+              ...S.btn(true),fontSize:16*scale+'px',padding:`${12*scale}px ${40*scale}px`,
+            }},'PLAY'),
+          ),
+        );
+      }
+
+      // GAME SCREEN
+      const boardContent=[];
+      // Top bear off (CPU)
+      // Points triangles
+      for(let i=0;i<24;i++){
+        boardContent.push(React.createElement(PointTriangle,{key:'tri'+i,index:i,top:isTopPoint(i)}));
+      }
+      // Checker stacks
+      const trainHL=getTrainingHighlights();
+      for(let i=0;i<24;i++){
+        boardContent.push(React.createElement(CheckerStack,{
+          key:'pt'+i,point:i,
+          onClick:handlePointClick,
+          isSelected:g.selected===i,
+          isValidDest:g.validDests.includes(i),
+          isLastMoved:g.lastMovedTo===i,
+          isBestSource:trainHL.sources.has(i),
+          isBestDest:trainHL.dests.has(i),
+        }));
+      }
+      // Bar
+      boardContent.push(React.createElement(BarArea,{key:'bar'}));
+
+      const boardHeight=POINT_H*2+60;
+
+      // Training panel
+      const trainingPanel=g.training&&g.analysis&&g.analysis.best?React.createElement('div',{style:{
+        ...S.panel,width:Math.min(504,504*scale)+'px',animation:'fadeIn 0.3s ease-out',marginTop:'8px',
+      }},
+        // Header with confidence indicator
+        React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'8px'}},
+          React.createElement('div',{style:{fontSize:'11px',color:'#f0c040',letterSpacing:'2px'}},'STRATEGY ANALYSIS'),
+          g.analysis.confidence?React.createElement('div',{style:{
+            fontSize:'9px',fontWeight:'bold',color:g.analysis.confidence.color,
+            background:'rgba(0,0,0,0.3)',border:'1px solid '+g.analysis.confidence.color+'44',
+            padding:'2px 8px',borderRadius:'10px',letterSpacing:'1px',
+          }},g.analysis.confidence.label):null,
+        ),
+        // Confidence detail
+        g.analysis.confidence?React.createElement('div',{style:{
+          fontSize:'9px',color:g.analysis.confidence.color,marginBottom:'6px',opacity:0.8,
+        }},g.analysis.confidence.detail):null,
+        // Strategy tip
+        React.createElement('div',{style:{fontSize:'12px',color:'#e8d5a3',marginBottom:'8px'}},getStrategyTip(g.analysis)),
+        // Tags
+        React.createElement('div',{style:{display:'flex',flexWrap:'wrap',gap:'4px',marginBottom:'8px'}},
+          g.analysis.best.tags.map((t,i)=>React.createElement('span',{key:i,style:{
+            fontSize:'9px',fontWeight:'bold',color:t.color,background:t.bg,
+            padding:'2px 6px',borderRadius:'4px',letterSpacing:'1px',
+          }},t.label))
+        ),
+        // Best move
+        React.createElement('div',{style:{fontSize:'10px',color:'#8a7a5a'}},
+          'Best: ',g.analysis.best.moves.map(m=>{
+            const from=m.from===-1?'BAR':(m.from+1);
+            const to=m.to===-2?'OFF':(m.to+1);
+            return from+' → '+to;
+          }).join(', '),
+          ' (score: ',Math.round(g.analysis.best.score),')',
+        ),
+        // Alternative moves
+        g.analysis.moves.length>1?React.createElement('div',{style:{marginTop:'6px',maxHeight:'60px',overflowY:'auto'}},
+          g.analysis.moves.slice(1,5).map((m,i)=>React.createElement('div',{key:i,style:{fontSize:'9px',color:'#6b4a2a',marginBottom:'2px'}},
+            '#'+(i+2)+': ',m.moves.map(mv=>{
+              const from=mv.from===-1?'BAR':(mv.from+1);
+              const to=mv.to===-2?'OFF':(mv.to+1);
+              return from+'→'+to;
+            }).join(', '),' (',Math.round(m.score),')',
+            React.createElement('span',{style:{marginLeft:'4px'}},m.tags.map((t,j)=>React.createElement('span',{key:j,style:{
+              fontSize:'8px',color:t.color,background:t.bg,padding:'1px 3px',borderRadius:'2px',marginLeft:'2px',
+            }},t.label)))
+          ))
+        ):null,
+      ):null;
+
+      return React.createElement('div',{style:S.bg},
+        // Header
+        React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',width:Math.min(520,520*scale)+'px',marginBottom:'6px'}},
+          React.createElement('div',{style:{fontSize:14*scale+'px',fontWeight:'bold',color:'#daa557'}},
+            'BACKGAMMON',
+            g.training?React.createElement('span',{style:{fontSize:'9px',color:'#3a8a4a',marginLeft:'8px'}},'TRAINING'):'',
+          ),
+          React.createElement('button',{onClick:()=>{g.phase=P.MENU;tick()},style:{
+            ...S.btn(false),fontSize:'10px',padding:'4px 10px',
+          }},'MENU'),
+        ),
+        // Score
+        g.gameMode==='match'?React.createElement('div',{style:{
+          display:'flex',gap:'16px',alignItems:'center',marginBottom:'6px',fontSize:12*scale+'px',
+        }},
+          React.createElement('span',{style:{color:'#daa557'}},'You: ',React.createElement('b',null,g.matchScore[0])),
+          React.createElement('span',{style:{color:'#6b4a2a'}},' / ',g.matchLength),
+          React.createElement('span',{style:{color:'#8a5a3a'}},'CPU: ',React.createElement('b',null,g.matchScore[1])),
+          React.createElement(DoublingCube),
+          g.crawford?React.createElement('span',{style:{fontSize:'9px',color:'#e67e22'}},'CRAWFORD'):'',
+        ):null,
+        // Pip counts
+        React.createElement('div',{style:{display:'flex',gap:'20px',marginBottom:'4px',fontSize:10*scale+'px',color:'#8a7a5a'}},
+          React.createElement('span',null,'You: ',pipCount(g.state,0),' pips'),
+          React.createElement('span',null,'CPU: ',pipCount(g.state,1),' pips'),
+        ),
+        // Board
+        React.createElement('div',{style:{display:'flex',alignItems:'stretch',gap:'4px'}},
+          React.createElement(BearOffTray,{player:1}),
+          React.createElement('div',{style:{...S.board,height:boardHeight+'px',position:'relative',overflow:'hidden'}},
+            // Mid line
+            React.createElement('div',{style:{
+              position:'absolute',top:'50%',left:'0',right:'0',height:'2px',
+              background:'linear-gradient(90deg,transparent,#6b4a2a,transparent)',zIndex:1,
+            }}),
+            ...boardContent,
+          ),
+          React.createElement(BearOffTray,{player:0}),
+        ),
+        // Dice & Controls
+        React.createElement('div',{style:{display:'flex',alignItems:'center',gap:'12px',marginTop:'8px',minHeight:'50px'}},
+          g.dice.length>0||g.diceAnim?React.createElement('div',{style:{display:'flex',gap:'6px'}},
+            React.createElement(Die,{value:g.dice[0],rolling:g.diceAnim}),
+            React.createElement(Die,{value:g.dice[1],rolling:g.diceAnim}),
+          ):null,
+          g.remainingDice.length>0&&g.phase===P.MOVING?React.createElement('div',{style:{fontSize:'10px',color:'#8a7a5a'}},
+            'Remaining: ',g.remainingDice.join(', ')
+          ):null,
+        ),
+        // Action buttons
+        React.createElement('div',{style:{display:'flex',gap:'8px',marginTop:'6px',flexWrap:'wrap',justifyContent:'center'}},
+          g.phase===P.ROLLING&&g.currentPlayer===0&&!g.diceAnim?
+            React.createElement('button',{onClick:handlePlayerRoll,style:S.btn(true)},'🎲 ROLL'):null,
+          g.phase===P.ROLLING&&g.currentPlayer===0&&!g.diceAnim&&g.gameMode==='match'&&!g.crawford&&(g.cubeOwner===-1||g.cubeOwner===0)?
+            React.createElement('button',{onClick:handlePlayerDouble,style:{...S.btn(false),color:'#f0c040'}},'DOUBLE'):null,
+          g.phase===P.MOVING&&g.turnMoves.length>0?
+            React.createElement('button',{onClick:undoLastMove,style:{...S.btn(false),fontSize:'11px'}},'↩ UNDO'):null,
+          g.phase===P.MOVING&&g.remainingDice.length===0?
+            React.createElement('button',{onClick:()=>endTurn(),style:S.btn(true)},'CONFIRM'):null,
+          g.phase===P.DOUBLING&&g.currentPlayer===0?React.createElement(React.Fragment,null,
+            React.createElement('button',{onClick:()=>handleDoubleResponse(true),style:S.btn(true)},'ACCEPT'),
+            React.createElement('button',{onClick:()=>handleDoubleResponse(false),style:{...S.btn(false),color:'#c0392b'}},'DECLINE'),
+          ):null,
+          g.phase===P.BETWEEN_GAMES?
+            React.createElement('button',{onClick:()=>{startNewGame();tick()},style:S.btn(true)},'NEXT GAME'):null,
+          g.phase===P.GAME_OVER?React.createElement(React.Fragment,null,
+            React.createElement('button',{onClick:startGame,style:S.btn(true)},'NEW MATCH'),
+            React.createElement('button',{onClick:()=>{g.phase=P.MENU;tick()},style:S.btn(false)},'MENU'),
+          ):null,
+        ),
+        // Message
+        React.createElement('div',{style:{
+          marginTop:'8px',fontSize:13*scale+'px',color:g.phase===P.GAME_OVER?'#f0c040':'#e8d5a3',
+          minHeight:'20px',textAlign:'center',
+          animation:g.phase===P.GAME_OVER?'celebratePulse 2s infinite':'none',
+        }},g.message),
+        // Training panel
+        trainingPanel,
+        // History
+        g.history.length>0?React.createElement('div',{style:{
+          ...S.panel,width:Math.min(504,504*scale)+'px',marginTop:'8px',maxHeight:'100px',overflowY:'auto',
+        }},
+          React.createElement('div',{style:{fontSize:'10px',color:'#8a7a5a',letterSpacing:'1px',marginBottom:'4px'}},'MOVE HISTORY'),
+          g.history.map((h,i)=>React.createElement('div',{key:i,style:{fontSize:'9px',color:'#6b4a2a',marginBottom:'2px'}},
+            React.createElement('span',{style:{color:h.player===0?'#daa557':'#8a5a3a'}},h.player===0?'You':'CPU'),
+            ' rolled ',h.dice.join('-'),': ',
+            h.moves.map(m=>{
+              const from=m.from===-1?'BAR':(m.from+1);
+              const to=(m.to===-2||m.to===25)?'OFF':(m.to+1);
+              return from+'/'+to;
+            }).join(', '),
+          ))
+        ):null,
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+  </script>
+</body>
+</html>
