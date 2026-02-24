@@ -760,30 +760,190 @@
       return{moves:scored,best:scored[0],confidence,isOpening};
     }
 
-    function getStrategyTip(analysis){
-      if(!analysis.best)return'No legal moves available.';
+    function getStrategyExplanation(analysis,state,player){
+      if(!analysis.best)return['No legal moves available.'];
       const b=analysis.best;
       const tags=b.tags.map(t=>t.label);
+      const moves=b.moves;
+      const reasons=[];
+      const opp=1-player;
+
+      // ─── Opening book moves ───
       if(tags.includes('BOOK')){
-        // Give opening-specific advice
-        const moves=b.moves;
         const makePoint=moves.length===2&&moves[0].to===moves[1].to;
         if(makePoint){
           const ptName=moves[0].to+1;
-          return'Book move: Make the '+ptName+'-point. Establishing key points early is fundamental.';
+          const pointNames={5:'5-point (the most valuable point — anchors your home board and blocks the opponent)',
+            4:'4-point (a strong inner-board point that helps trap opponents on the bar)',
+            3:'3-point (an inner-board point that builds your home board wall)',
+            7:'bar point (blocks opponents escaping and extends your prime toward the midfield)'};
+          reasons.push('Book move: Make your '+(pointNames[ptName]||ptName+'-point')+'.');
+          reasons.push('Making a new point with both dice is always best when possible — you create a safe anchor with no blot risk.');
+        }else if(moves.length===1){
+          const dist=moves[0].from-moves[0].to;
+          if(dist===11)reasons.push('Book move: "Lover\'s Leap" — run a back checker all the way to the midpoint (point 13). This is the only way to play 6-5; you escape a back checker to safety in one move.');
+          else if(dist===10)reasons.push('Book move: Run a back checker to point 14. With a combined total of 10, running gives you the best chance to escape. The blot is relatively safe since opponents need specific rolls to hit from far away.');
+          else reasons.push('Book move: Run a back checker. The large dice total makes escaping more valuable than building.');
+        }else{
+          // Split and build
+          const splitMove=moves.find(m=>m.from===23);
+          const buildMove=moves.find(m=>m.from===12||m.from===7||m.from===5);
+          if(splitMove&&buildMove){
+            const splitTo=splitMove.to+1;
+            const buildTo=buildMove.to+1;
+            reasons.push('Book move: Split to the '+splitTo+'-point while building to the '+buildTo+'-point.');
+            if(splitTo>=20&&splitTo<=23)reasons.push('Splitting a back checker to the opponent\'s outer board gives you two chances to make an advanced anchor next turn, improving your position if you get hit.');
+            if(splitTo===18)reasons.push('Splitting to the opponent\'s bar point (18) is especially strong — if you make this point next turn, you\'ll significantly restrict the opponent\'s movement.');
+            if(buildTo<=8)reasons.push('Bringing a builder down from the midpoint creates extra chances to make key points in your home board on future rolls.');
+          }else{
+            reasons.push('Book move: Develop both sides of the board — splitting back checkers while bringing builders into range.');
+          }
         }
-        if(moves.length===1&&moves[0].from===23)return'Book move: Run a back checker. Escape while you can!';
-        return'Book move: Split and build — develop both sides of your position.';
+        return reasons;
       }
-      if(tags.includes('BEAR OFF'))return'Bearing off checkers — keep the momentum going!';
-      if(tags.includes('HIT')&&tags.includes('PRIME'))return'Hit and extend your prime — excellent combination!';
-      if(tags.includes('HIT'))return'Hitting sends the opponent to the bar, costing them tempo.';
-      if(tags.includes('PRIME'))return'Building a prime blocks the opponent\'s movement.';
-      if(tags.includes('ANCHOR'))return'Strengthening your home board — key for trapping opponents.';
-      if(tags.includes('SAFE'))return'Reducing blot exposure — solid defensive play.';
-      if(tags.includes('BLOT'))return'This leaves a blot exposed — but it\'s the best option available.';
-      if(tags.includes('SLOT'))return'Slotting a point — risky but sets up for making the point.';
-      return'Advance your position with the best available move.';
+
+      // ─── Non-opening positional analysis ───
+      // Detect the game phase
+      let contact=false;
+      for(let i=0;i<24;i++){
+        if(playerCheckerAt(state.board,i,player)){
+          if(player===0){for(let j=i+1;j<24;j++)if(state.board[j]<0){contact=true;break}}
+          else{for(let j=0;j<i;j++)if(state.board[j]>0){contact=true;break}}
+        }
+        if(contact)break;
+      }
+      const isRace=!contact&&state.bar[0]===0&&state.bar[1]===0;
+      const myPip=pipCount(state,player);
+      const oppPip=pipCount(state,opp);
+
+      // Bearing off
+      if(tags.includes('BEAR OFF')){
+        const bearCount=moves.filter(m=>m.to===-2||m.to===25).length;
+        if(bearCount>=2)reasons.push('Bear off '+bearCount+' checkers this turn — maximize the number you remove each roll.');
+        else reasons.push('Bear off a checker to keep your race moving.');
+        if(isRace){
+          const pipLead=oppPip-myPip;
+          if(pipLead>0)reasons.push('You\'re leading the race by '+pipLead+' pips — keep bearing off efficiently.');
+          else if(pipLead<0)reasons.push('You\'re behind by '+(-pipLead)+' pips — every bear-off counts.');
+        }
+        // Check if there's wastage from stacking
+        const resultOff=b.state.off[player];
+        const remaining=15-resultOff;
+        if(remaining<=4)reasons.push('Only '+remaining+' checker'+(remaining===1?'':'s')+' left to bear off — the finish line is in sight.');
+        return reasons;
+      }
+
+      // Hitting
+      if(tags.includes('HIT')){
+        const hitPoints=moves.filter(mv=>mv.to>=0&&mv.to<24&&(
+          (player===0&&state.board[mv.to]===-1)||(player===1&&state.board[mv.to]===1)
+        ));
+        const hitPt=hitPoints[0]?hitPoints[0].to+1:'';
+        reasons.push('Hit the opponent\'s blot on point '+hitPt+', sending it to the bar.');
+        // Why hitting matters here
+        if(state.bar[opp]===0){
+          // Count home board points
+          let hp=0;
+          if(player===0){for(let i=0;i<6;i++)if(state.board[i]>=2)hp++}
+          else{for(let i=18;i<24;i++)if(state.board[i]<=-2)hp++}
+          if(hp>=3)reasons.push('With '+hp+' home board points made, the opponent will have a hard time re-entering — this hit could be devastating.');
+          else reasons.push('Hitting costs the opponent a full turn to re-enter and rethrow, gaining you tempo.');
+        }else{
+          reasons.push('The opponent already has a checker on the bar — adding another makes re-entry even harder.');
+        }
+        if(tags.includes('PRIME'))reasons.push('This also extends your prime, further restricting the opponent\'s movement.');
+      }
+
+      // Prime building
+      if(tags.includes('PRIME')&&!tags.includes('HIT')){
+        let con=0,best=0;
+        for(let i=0;i<24;i++){if(countAt(b.state.board,i,player)>=2){con++;if(con>best)best=con}else con=0}
+        reasons.push('Extend your prime to '+best+' consecutive points.');
+        if(best>=4)reasons.push('A '+best+'-point prime is a serious blockade — opponents need large doubles to escape, which happen less than 3% of the time.');
+        else if(best===3)reasons.push('A 3-prime starts limiting the opponent\'s escape routes. Try to grow it further.');
+        // Check if opponent checkers are trapped behind it
+        let trapped=0;
+        for(let i=0;i<24;i++){
+          if(countAt(b.state.board,i,opp)>0){
+            if(player===0&&i>=12)trapped+=countAt(b.state.board,i,opp);
+          }
+        }
+        if(trapped>0)reasons.push(trapped+' opponent checker'+(trapped===1?'is':'s are')+' stuck behind your prime.');
+      }
+
+      // Anchoring / home board
+      if(tags.includes('ANCHOR')){
+        let hp=0;
+        if(player===0){for(let i=0;i<6;i++)if(b.state.board[i]>=2)hp++}
+        reasons.push('Make a new home board point, giving you '+hp+' of 6.');
+        if(hp>=4)reasons.push('With '+hp+' home board points, any hit you land will be very costly for the opponent.');
+        else reasons.push('Building your home board now prepares you to punish any future hits.');
+      }
+
+      // Safety
+      if(tags.includes('SAFE')&&reasons.length===0){
+        let blotsBefore=0,blotsAfter=0;
+        for(let i=0;i<24;i++){
+          if(player===0){if(state.board[i]===1)blotsBefore++;if(b.state.board[i]===1)blotsAfter++}
+        }
+        const reduced=blotsBefore-blotsAfter;
+        reasons.push('Cover '+reduced+' blot'+(reduced===1?'':'s')+', reducing your exposure.');
+        // Find the most dangerous blot that was covered
+        for(const mv of moves){
+          if(mv.to>=0&&mv.to<24&&countAt(b.state.board,mv.to,player)===2&&countAt(state.board,mv.to,player)===1){
+            const prob=hitProbability(state.board,mv.to,player);
+            if(prob>0)reasons.push('Point '+(mv.to+1)+' had a '+Math.round(prob*100)+'% chance of being hit — now it\'s safe.');
+          }
+        }
+      }
+
+      // Blot risk
+      if(tags.includes('BLOT')&&reasons.length===0){
+        reasons.push('This move leaves a blot, but it\'s the best option available.');
+        // Find the new blot and its danger
+        for(const mv of moves){
+          if(mv.to>=0&&mv.to<24&&countAt(b.state.board,mv.to,player)===1&&countAt(state.board,mv.to,player)!==1){
+            const prob=hitProbability(b.state.board,mv.to,player);
+            if(prob>0){
+              reasons.push('The blot on point '+(mv.to+1)+' has a '+Math.round(prob*100)+'% chance of being hit.');
+              if(prob<0.2)reasons.push('That\'s a relatively low risk — worth taking for the positional gain.');
+              else if(prob>0.4)reasons.push('That\'s high risk, but the alternatives score even worse.');
+            }
+          }
+        }
+      }
+
+      // Slotting
+      if(tags.includes('SLOT')&&reasons.length===0){
+        const slotted=moves.find(mv=>mv.to>=0&&mv.to<24&&countAt(b.state.board,mv.to,player)===1);
+        if(slotted){
+          const prob=hitProbability(b.state.board,slotted.to,player);
+          reasons.push('Slot point '+(slotted.to+1)+' — place a lone checker to try to make this point next turn.');
+          reasons.push('If the opponent misses ('+Math.round((1-prob)*100)+'% chance), you can cover it and own a valuable new point.');
+        }
+      }
+
+      // Race context (no other tags matched)
+      if(reasons.length===0&&isRace){
+        reasons.push('Pure race — move your checkers home as efficiently as possible.');
+        const pipLead=oppPip-myPip;
+        if(pipLead>15)reasons.push('You have a comfortable '+pipLead+'-pip lead. Avoid wastage by spreading checkers evenly.');
+        else if(pipLead>0)reasons.push('You lead by '+pipLead+' pips. Keep it steady.');
+        else if(pipLead<0)reasons.push('You trail by '+(-pipLead)+' pips. You need favorable rolls to catch up.');
+      }
+
+      // Fallback
+      if(reasons.length===0){
+        // Generic but still positional
+        if(contact){
+          if(myPip<oppPip)reasons.push('You have the pip lead — maintain your advantage while keeping your position secure.');
+          else reasons.push('Improve your position while minimizing blot exposure.');
+        }else{
+          reasons.push('Advance your checkers toward home.');
+        }
+      }
+
+      return reasons;
     }
 
     /* ─── Main App Component ─── */
@@ -1692,8 +1852,17 @@
         g.analysis.confidence?React.createElement('div',{style:{
           fontSize:'9px',color:g.analysis.confidence.color,marginBottom:'6px',opacity:0.8,
         }},g.analysis.confidence.detail):null,
-        // Strategy tip
-        React.createElement('div',{style:{fontSize:'12px',color:'#e8d5a3',marginBottom:'8px'}},getStrategyTip(g.analysis)),
+        // Strategy explanation (multi-line why)
+        React.createElement('div',{style:{marginBottom:'8px'}},
+          getStrategyExplanation(g.analysis,g.state,0).map((line,i)=>
+            React.createElement('div',{key:i,style:{
+              fontSize:i===0?'12px':'10px',
+              color:i===0?'#e8d5a3':'#b8a880',
+              marginBottom:i===0?'4px':'2px',
+              lineHeight:'1.4',
+            }},line)
+          )
+        ),
         // Tags
         React.createElement('div',{style:{display:'flex',flexWrap:'wrap',gap:'4px',marginBottom:'8px'}},
           g.analysis.best.tags.map((t,i)=>React.createElement('span',{key:i,style:{
