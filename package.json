@@ -1,0 +1,32 @@
+{
+  "name": "backgammon",
+  "version": "1.0.0",
+  "description": "Backgammon - Classic Strategy Game",
+  "private": true,
+  "scripts": {
+    "sync": "npx cap sync",
+    "open:ios": "npx cap open ios",
+    "open:android": "npx cap open android"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matthew-esbro/backgammon-game.git"
+  },
+  "keywords": [],
+  "author": "Esbro Labs LLC",
+  "license": "ISC",
+  "dependencies": {
+    "@capacitor-community/admob": "^8.0.0",
+    "@capacitor/android": "^8.1.0",
+    "@capacitor/app": "^8.1.0",
+    "@capacitor/core": "^8.1.0",
+    "@capacitor/haptics": "^8.0.2",
+    "@capacitor/ios": "^8.1.0",
+    "@capacitor/splash-screen": "^8.0.1",
+    "@capacitor/status-bar": "^8.0.1",
+    "@capgo/native-purchases": "^8.2.3"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.1.0"
+  }
+}

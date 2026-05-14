@@ -1,0 +1,22 @@
+{
+  "appId": "com.esbrolabs.backgammon",
+  "appName": "Backgammon",
+  "webDir": "www",
+  "plugins": {
+    "SplashScreen": {
+      "launchShowDuration": 1500,
+      "launchAutoHide": true,
+      "backgroundColor": "#1a0e07",
+      "showSpinner": false
+    },
+    "StatusBar": {
+      "overlaysWebView": true,
+      "style": "DARK",
+      "backgroundColor": "#1a0e07"
+    },
+    "AdMob": {
+      "appIdIos": "",
+      "appIdAndroid": ""
+    }
+  }
+}
