@@ -2487,11 +2487,36 @@
         if(g.remainingDice.length>0){
           g.allLegalMoves=generateMoves(g.state,g.remainingDice,0);
           if(g.training){
-            /* Mid-turn re-analysis: use local only. The server (gnubg via bgweb)
-               expects a fresh roll's worth of dice; passing remaining dice would
-               make it think doubles for a single die left, or return a play sized
-               for the original roll instead of what's actually still to play. */
-            g.analysis=analyzeMoves(g.state,g.remainingDice,0);
+            /* Advance through the stored plan from turn start: if every move
+               played so far matches the leading moves of the recommended play,
+               slice them off and keep displaying the remaining moves at the
+               original analysis quality (gnubg if the server responded in
+               time, otherwise local). Only re-analyze if the player deviated
+               from the plan — we fall back to local in that case since the
+               server's /getmoves endpoint expects a fresh roll, not the
+               remainder of one. */
+            const stored=g.analysis;
+            const plan=stored&&stored.best&&stored.best.moves?stored.best.moves:null;
+            const played=g.turnMoves;
+            let onPlan=false;
+            if(plan&&plan.length>=played.length&&played.length>0){
+              onPlan=true;
+              for(let i=0;i<played.length;i++){
+                if(plan[i].from!==played[i].from||plan[i].to!==played[i].to){
+                  onPlan=false;break;
+                }
+              }
+            }
+            if(onPlan){
+              const remaining=plan.slice(played.length);
+              if(remaining.length>0){
+                g.analysis={...stored,best:{...stored.best,moves:remaining}};
+              }else{
+                g.analysis=null;
+              }
+            }else{
+              g.analysis=analyzeMoves(g.state,g.remainingDice,0);
+            }
           }
           const hasMore=g.allLegalMoves.some(m=>m.moves.length>0);
           if(!hasMore){
