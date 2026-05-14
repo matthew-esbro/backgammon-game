@@ -1,0 +1,13 @@
+node_modules/
+ios/App/Pods/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+DerivedData/
+
+# Local recordings and ad-hoc captures
+*.MP4
+*.mov
+*.mp4
+
+# OS / IDE noise
+.DS_Store
