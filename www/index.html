@@ -2487,17 +2487,12 @@
         if(g.remainingDice.length>0){
           g.allLegalMoves=generateMoves(g.state,g.remainingDice,0);
           if(g.training){
-          /* Show fast local result immediately, then update with server result if available */
-          g.analysis=analyzeMoves(g.state,g.remainingDice,0);
-          if(g.useServerAnalysis&&ANALYSIS_SERVER_URL){
-            const snapState=g.state;const snapDice=g.remainingDice.slice();
-            analyzeMovesServer(snapState,snapDice,0).then(serverResult=>{
-              /* Only update if state hasn't changed */
-              if(serverResult&&g.state===snapState&&g.training)g.analysis=serverResult;
-              tick();
-            }).catch(()=>{});
+            /* Mid-turn re-analysis: use local only. The server (gnubg via bgweb)
+               expects a fresh roll's worth of dice; passing remaining dice would
+               make it think doubles for a single die left, or return a play sized
+               for the original roll instead of what's actually still to play. */
+            g.analysis=analyzeMoves(g.state,g.remainingDice,0);
           }
-        }
           const hasMore=g.allLegalMoves.some(m=>m.moves.length>0);
           if(!hasMore){
             g.message='No more legal moves.';
