@@ -1,0 +1,37 @@
+{
+	# Fly.io terminates TLS at the edge and sends plain HTTP to the container.
+	# Disable Caddy's auto HTTPS so it serves plain HTTP on :8080.
+	auto_https off
+}
+
+:8080 {
+	# CORS preflight requests
+	@options method OPTIONS
+	handle @options {
+		header {
+			Access-Control-Allow-Origin "*"
+			Access-Control-Allow-Methods "GET, POST, OPTIONS"
+			Access-Control-Allow-Headers "Content-Type, Authorization"
+			Access-Control-Max-Age "86400"
+		}
+		respond "" 204
+	}
+
+	# Health check endpoint
+	@health path /health /
+	handle @health {
+		respond "OK" 200
+	}
+
+	# All other requests: add CORS headers, proxy to bgweb-api
+	handle {
+		header {
+			Access-Control-Allow-Origin "*"
+			Access-Control-Allow-Methods "GET, POST, OPTIONS"
+			Access-Control-Allow-Headers "Content-Type, Authorization"
+			# Cache responses for repeated positions (24 hours)
+			Cache-Control "public, max-age=86400"
+		}
+		reverse_proxy localhost:8081
+	}
+}
