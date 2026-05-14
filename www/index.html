@@ -1,0 +1,3103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Backgammon</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; overflow: hidden; }
+    body { background: #1a0e07; }
+    #root {
+      height: 100vh;
+      box-sizing: border-box;
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+      padding-left: env(safe-area-inset-left);
+      padding-right: env(safe-area-inset-right);
+      display: flex;
+      flex-direction: column;
+    }
+    #root > div { height: 100% !important; max-height: 100% !important; }
+    @keyframes diceShake { 0%,100%{transform:rotate(0deg)} 25%{transform:rotate(8deg)} 75%{transform:rotate(-8deg)} }
+    @keyframes checkerMove { 0%{transform:scale(1.2);opacity:0.7} 100%{transform:scale(1);opacity:1} }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+    @keyframes fadeIn { 0%{opacity:0;transform:translateY(8px)} 100%{opacity:1;transform:translateY(0)} }
+    @keyframes celebratePulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.05)} }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script id="ai-worker" type="text/worker">
+    /* ─── Backgammon AI Worker ─── */
+    function cloneState(s){return{board:s.board.slice(),bar:[s.bar[0],s.bar[1]],off:[s.off[0],s.off[1]]}}
+    function applyMove(state,from,to,player){
+      var s=cloneState(state);
+      if(from===-1){s.bar[player]--}else{if(player===0)s.board[from]--;else s.board[from]++}
+      if(to===25||to===-2){s.off[player]++;return s}
+      if(player===0){
+        if(s.board[to]===-1){s.board[to]=1;s.bar[1]++}
+        else s.board[to]++;
+      }else{
+        if(s.board[to]===1){s.board[to]=-1;s.bar[0]++}
+        else s.board[to]--;
+      }
+      return s;
+    }
+    function playerCheckerAt(board,pt,player){
+      if(player===0)return board[pt]>0;
+      return board[pt]<0;
+    }
+    function countAt(board,pt,player){
+      if(player===0)return Math.max(0,board[pt]);
+      return Math.max(0,-board[pt]);
+    }
+    function canLand(board,pt,player){
+      if(player===0)return board[pt]>=-1;
+      return board[pt]<=1;
+    }
+    function allInHome(state,player){
+      if(state.bar[player]>0)return false;
+      if(player===0){for(var i=6;i<24;i++)if(state.board[i]>0)return false}
+      else{for(var i=0;i<18;i++)if(state.board[i]<0)return false}
+      return true;
+    }
+    function highestOccupied(state,player){
+      if(player===0){for(var i=23;i>=0;i--)if(state.board[i]>0)return i;return -1}
+      else{for(var i=0;i<24;i++)if(state.board[i]<0)return i;return -1}
+    }
+    function generateMoves(state,dice,player){
+      var results=[];
+      function recurse(st,remaining,moves){
+        if(remaining.length===0){results.push({state:st,moves:moves});return}
+        var die=remaining[0];var rest=remaining.slice(1);
+        var found=false;
+        if(st.bar[player]>0){
+          var target=player===0?24-die:die-1;
+          if(target>=0&&target<24&&canLand(st.board,target,player)){
+            var ns=applyMove(st,-1,target,player);
+            found=true;
+            recurse(ns,rest,moves.concat([{from:-1,to:target,die:die}]));
+          }
+          if(!found)recurse(st,rest,moves);
+          return;
+        }
+        var inHome=allInHome(st,player);
+        var pts=[];
+        for(var i=0;i<24;i++){
+          if(playerCheckerAt(st.board,i,player)){
+            var target;
+            if(player===0)target=i-die;else target=i+die;
+            if(target>=0&&target<24){
+              if(canLand(st.board,target,player)){pts.push({from:i,to:target});found=true}
+            } else if(inHome){
+              if(player===0&&target<0){
+                if(target===-1||i>=highestOccupied(st,player)){
+                  pts.push({from:i,to:-2});found=true;
+                }
+              }
+              if(player===1&&target>=24){
+                if(target===24||i<=highestOccupied(st,player)){
+                  pts.push({from:i,to:25});found=true;
+                }
+              }
+            }
+          }
+        }
+        if(!found){recurse(st,rest,moves);return}
+        for(var p=0;p<pts.length;p++){
+          var mv=pts[p];
+          var ns=applyMove(st,mv.from,mv.to,player);
+          recurse(ns,rest,moves.concat([{from:mv.from,to:mv.to,die:die}]));
+        }
+      }
+      var diceList=dice.slice();
+      recurse(state,diceList,[]);
+      if(diceList.length===2&&diceList[0]!==diceList[1]){
+        var rev=[diceList[1],diceList[0]];
+        recurse(state,rev,[]);
+      }
+      var maxLen=0;
+      for(var i=0;i<results.length;i++){if(results[i].moves.length>maxLen)maxLen=results[i].moves.length}
+      results=results.filter(function(r){return r.moves.length===maxLen});
+      /* Backgammon rule: if only 1 die can be played and dice differ, must use larger die */
+      if(maxLen===1&&diceList.length===2&&diceList[0]!==diceList[1]){
+        var maxDie=Math.max(diceList[0],diceList[1]);
+        var withLarger=results.filter(function(r){return r.moves[0]&&r.moves[0].die===maxDie});
+        if(withLarger.length>0)results=withLarger;
+      }
+      var seen={};var unique=[];
+      for(var i=0;i<results.length;i++){
+        var key=results[i].state.board.join(',')+';'+results[i].state.bar.join(',')+';'+results[i].state.off.join(',');
+        if(!seen[key]){seen[key]=true;unique.push(results[i])}
+      }
+      return unique;
+    }
+    function pipCount(state,player){
+      var count=0;
+      if(player===0){
+        count+=state.bar[0]*25;
+        for(var i=0;i<24;i++)if(state.board[i]>0)count+=state.board[i]*(i+1);
+      }else{
+        count+=state.bar[1]*25;
+        for(var i=0;i<24;i++)if(state.board[i]<0)count+=(-state.board[i])*(24-i);
+      }
+      return count;
+    }
+    function hitProb(board,blotIdx,player){
+      var opp=1-player;var hits=0;
+      for(var d1=1;d1<=6;d1++){
+        for(var d2=1;d2<=6;d2++){
+          var dists=[d1,d2,d1+d2];
+          if(d1===d2){dists.push(d1*3);dists.push(d1*4)}
+          var hit=false;
+          for(var k=0;k<dists.length;k++){
+            var dist=dists[k];var from;
+            if(opp===0)from=blotIdx+dist;else from=blotIdx-dist;
+            if(from>=0&&from<24){
+              if(opp===0&&board[from]>0){hit=true;break}
+              if(opp===1&&board[from]<0){hit=true;break}
+            }
+          }
+          if(hit)hits++;
+        }
+      }
+      return hits/36;
+    }
+    /* ─── Anchor quality lookup: opponent's point (1-6) → value ─── */
+    var ANCHOR_VAL=[1,3,6,14,18,10]; /* 1pt,2pt,3pt,4pt,5pt(golden),bar-pt */
+
+    /* ─── Enhanced hit probability with indirect shots ─── */
+    function hitProbFull(board,blotIdx,player){
+      var opp=1-player;var hits=0;
+      for(var d1=1;d1<=6;d1++){for(var d2=1;d2<=6;d2++){
+        var hit=false;
+        /* Direct shots */
+        var dists=[d1,d2,d1+d2];
+        if(d1===d2){dists.push(d1*3);dists.push(d1*4)}
+        for(var k=0;k<dists.length;k++){
+          var dist=dists[k];var from;
+          if(opp===0)from=blotIdx+dist;else from=blotIdx-dist;
+          if(from>=0&&from<24){
+            if(opp===0&&board[from]>0){hit=true;break}
+            if(opp===1&&board[from]<0){hit=true;break}
+          }
+        }
+        /* Indirect (combination) shots: src→mid→blot */
+        if(!hit&&d1!==d2){
+          var combos=[[d1,d2],[d2,d1]];
+          for(var c=0;c<combos.length;c++){
+            var a=combos[c][0],b=combos[c][1];
+            /* Check all opponent checkers that could use a+b path */
+            for(var src=0;src<24;src++){
+              if(!playerCheckerAt(board,src,opp))continue;
+              var mid;
+              if(opp===0)mid=src-a;else mid=src+a;
+              if(mid<0||mid>=24)continue;
+              if(!canLand(board,mid,opp))continue;
+              var dest;
+              if(opp===0)dest=mid-b;else dest=mid+b;
+              if(dest===blotIdx){hit=true;break}
+            }
+            if(hit)break;
+          }
+        }
+        if(hit)hits++;
+      }}
+      return hits/36;
+    }
+
+    /* ─── Contact detection helper ─── */
+    function hasContact(state){
+      for(var i=0;i<24;i++){
+        if(state.board[i]>0){for(var j=i+1;j<24;j++)if(state.board[j]<0)return true}
+      }
+      return state.bar[0]>0||state.bar[1]>0;
+    }
+
+    /* ─── Race Evaluator ─── */
+    function evaluateRace(state,player){
+      var opp=1-player;
+      var myPip=pipCount(state,player);
+      var oppPip=pipCount(state,opp);
+      var score=0;
+      /* Pip count advantage */
+      score+=(oppPip-myPip)*1.4;
+      /* Bearing off bonus */
+      score+=state.off[player]*14;score-=state.off[opp]*14;
+      /* Wastage: checkers stacked on low points waste high dice */
+      for(var i=0;i<24;i++){
+        var cnt=countAt(state.board,i,player);
+        if(cnt<=0)continue;
+        /* Point value from player's perspective (1-24, lower=closer to bearing off) */
+        var ptVal=player===0?(i+1):(24-i);
+        if(ptVal<=6){
+          /* Home board: penalize stacking beyond 2 */
+          if(cnt>2)score-=(cnt-2)*(7-ptVal)*1.5;
+        }
+        /* General stacking penalty */
+        if(cnt>3)score-=(cnt-3)*6;if(cnt>4)score-=(cnt-4)*8;if(cnt>5)score-=(cnt-5)*12;
+      }
+      /* Smooth distribution bonus: count gaps in home board */
+      var gaps=0;
+      if(player===0){for(var i=0;i<6;i++)if(state.board[i]<=0)gaps++}
+      else{for(var i=18;i<24;i++)if(state.board[i]>=0)gaps++}
+      if(gaps<=1)score+=5; /* nearly smooth */
+      /* Crossover penalty: checkers outside home board */
+      for(var i=0;i<24;i++){
+        var cnt=countAt(state.board,i,player);
+        if(cnt<=0)continue;
+        var ptVal=player===0?(i+1):(24-i);
+        if(ptVal>6)score-=cnt*Math.floor((ptVal-1)/6)*2; /* per quadrant crossed */
+      }
+      return score;
+    }
+
+    /* ─── Contact Evaluator ─── */
+    function evaluateContact(state,player){
+      var opp=1-player;
+      var myPip=pipCount(state,player);
+      var oppPip=pipCount(state,opp);
+      var score=0;
+      /* Pip count (less important in contact) */
+      score+=(oppPip-myPip)*0.4;
+      score+=state.off[player]*15;score-=state.off[opp]*15;
+      /* Bar penalties */
+      score-=state.bar[player]*28;score+=state.bar[opp]*20;
+      /* Blot exposure with enhanced hit probability.
+         Position weight reflects COST of being hit (pips lost going to bar): closer to home = higher cost.
+         Your own outer board (7-12) is most punishing if hit (deep loss + high reachability). */
+      var blotCount=0;
+      for(var i=0;i<24;i++){
+        if(player===0&&state.board[i]===1){
+          blotCount++;
+          var prob=hitProbFull(state.board,i,0);
+          var ptVal=i+1;
+          var pw;
+          if(ptVal<=6){pw=ptVal===5?2.0:ptVal===4?1.8:ptVal===6?1.5:1.0}
+          else if(ptVal<=12){pw=1.8} /* YOUR outer: high cost if hit + high reachability */
+          else if(ptVal<=18){pw=0.9} /* opp outer: lower cost (less pips lost) */
+          else{pw=0.4} /* opp home: minimal cost */
+          score-=prob*pw*22;
+        }else if(player===1&&state.board[i]===-1){
+          blotCount++;
+          var prob=hitProbFull(state.board,i,1);
+          var oppPtVal=24-i;
+          var pw;
+          if(oppPtVal<=6){pw=oppPtVal===5?2.0:oppPtVal===4?1.8:oppPtVal===6?1.5:1.0}
+          else if(oppPtVal<=12){pw=1.8}
+          else if(oppPtVal<=18){pw=0.9}
+          else{pw=0.4}
+          score-=prob*pw*22;
+        }
+      }
+      /* Multiple blots penalty: each additional blot is progressively worse */
+      if(blotCount>=2)score-=(blotCount-1)*8;
+      if(blotCount>=3)score-=(blotCount-2)*10;
+      /* Bonus for making points in key building range (5-11 from player perspective).
+         The bar point (7), 5-point, 4-point and outer board points are valuable for blocking. */
+      if(player===0){
+        for(var i=4;i<11;i++){ /* points 5-11 */
+          if(state.board[i]>=2){
+            var ptValue=i+1;
+            /* Higher bonus for the most blocking points: 5(golden), 7(bar), 8 */
+            var pointBonus=ptValue===5?6:ptValue===7?6:ptValue===8?5:ptValue===6?4:3;
+            score+=pointBonus;
+          }
+        }
+      }else{
+        for(var i=13;i<20;i++){ /* opp's points 5-11 */
+          if(state.board[i]<=-2){
+            var oppPtValue=24-i;
+            var pointBonus=oppPtValue===5?6:oppPtValue===7?6:oppPtValue===8?5:oppPtValue===6?4:3;
+            score+=pointBonus;
+          }
+        }
+      }
+      /* Prime detection */
+      var consecutive=0;var bestPrime=0;var primeStart=-1;
+      for(var i=0;i<24;i++){
+        if(countAt(state.board,i,player)>=2){consecutive++;if(consecutive>bestPrime){bestPrime=consecutive;primeStart=i-consecutive+1}}
+        else consecutive=0;
+      }
+      if(bestPrime>=2)score+=bestPrime*bestPrime*5;
+      if(bestPrime>=3){
+        var trapped=0;
+        for(var i=0;i<24;i++){
+          if(countAt(state.board,i,opp)>0){
+            if(player===0&&i>primeStart+bestPrime-1)trapped+=countAt(state.board,i,opp);
+            if(player===1&&i<primeStart)trapped+=countAt(state.board,i,opp);
+          }
+        }
+        score+=trapped*bestPrime*3;
+      }
+      /* Home board points */
+      var homePoints=0;
+      if(player===0){for(var i=0;i<6;i++)if(state.board[i]>=2)homePoints++}
+      else{for(var i=18;i<24;i++)if(state.board[i]<=-2)homePoints++}
+      var homeMultiplier=state.bar[opp]>0?10:6;
+      score+=homePoints*homeMultiplier;
+      if(homePoints===6)score+=25;
+      /* Anchor quality hierarchy */
+      if(player===0){for(var i=18;i<24;i++)if(state.board[i]>=2){var oppPt=24-i;score+=ANCHOR_VAL[oppPt-1]}}
+      else{for(var i=0;i<6;i++)if(state.board[i]<=-2){score+=ANCHOR_VAL[i]}}
+      /* Stacking penalty */
+      for(var i=0;i<24;i++){var cnt=countAt(state.board,i,player);if(cnt>3)score-=(cnt-3)*6;if(cnt>4)score-=(cnt-4)*8;if(cnt>5)score-=(cnt-5)*12}
+      /* Builder bonus */
+      if(player===0){for(var i=4;i<12;i++)if(state.board[i]===3)score+=3}
+      else{for(var i=12;i<20;i++)if(-state.board[i]===3)score+=3}
+      return score;
+    }
+
+    /* ─── Master Evaluator: dispatches to race or contact ─── */
+    function evaluateMaster(state,player){
+      var isRace=!hasContact(state)&&state.bar[0]===0&&state.bar[1]===0;
+      if(isRace)return evaluateRace(state,player);
+      var base=evaluateContact(state,player);
+      /* Extra prime bonus for 4+ primes */
+      var consecutive=0;var bestPrime=0;
+      for(var i=0;i<24;i++){
+        if(countAt(state.board,i,player)>=2){consecutive++;if(consecutive>bestPrime)bestPrime=consecutive}
+        else consecutive=0;
+      }
+      if(bestPrime>=4)base+=bestPrime*bestPrime*2;
+      return base;
+    }
+
+    /* ─── Basic evaluator for Rookie/Sharp ─── */
+    function evaluateState(state,player){
+      var isRace=!hasContact(state)&&state.bar[0]===0&&state.bar[1]===0;
+      if(isRace)return evaluateRace(state,player);
+      return evaluateContact(state,player);
+    }
+
+    /* ─── Monte Carlo Rollouts ─── */
+    function pickRolloutMove(state,dice,player){
+      var moves=generateMoves(state,dice,player);
+      if(moves.length===0)return null;
+      if(moves.length===1)return moves[0];
+      var best=moves[0];var bestSc=-Infinity;
+      for(var i=0;i<moves.length;i++){
+        var sc=evaluateMaster(moves[i].state,player)+Math.random()*4;
+        if(sc>bestSc){bestSc=sc;best=moves[i]}
+      }
+      return best;
+    }
+    function rolloutResult(startState,nextPlayer,maxDepth){
+      var cur=cloneState(startState);
+      var p=nextPlayer;
+      for(var t=0;t<maxDepth;t++){
+        if(cur.off[0]>=15)return 0;
+        if(cur.off[1]>=15)return 1;
+        var d1=Math.floor(Math.random()*6)+1;
+        var d2=Math.floor(Math.random()*6)+1;
+        var dl=d1===d2?[d1,d1,d1,d1]:[d1,d2];
+        var result=pickRolloutMove(cur,dl,p);
+        if(result)cur=result.state;
+        p=1-p;
+      }
+      return pipCount(cur,0)<pipCount(cur,1)?0:1;
+    }
+    function searchMC(state,dice,player,rollouts,topCandidates,maxDepth){
+      var allMoves=generateMoves(state,dice,player);
+      if(allMoves.length===0)return null;
+      if(allMoves.length===1)return allMoves[0];
+      var scored=[];
+      for(var i=0;i<allMoves.length;i++){
+        scored.push({idx:i,sc:evaluateMaster(allMoves[i].state,player)});
+      }
+      scored.sort(function(a,b){return b.sc-a.sc});
+      var topN=Math.min(topCandidates||4,scored.length);
+      var bestMove=null;var bestWinCount=-1;
+      for(var c=0;c<topN;c++){
+        var move=allMoves[scored[c].idx];
+        var myWins=0;
+        for(var i=0;i<rollouts;i++){
+          var winner=rolloutResult(move.state,1-player,maxDepth||60);
+          if(winner===player)myWins++;
+        }
+        if(myWins>bestWinCount){bestWinCount=myWins;bestMove=move}
+      }
+      return bestMove;
+    }
+
+    /* ─── 2-Ply Search (kept for fallback) ─── */
+    function search2Ply(state,dice,player){
+      var opp=1-player;
+      var allMoves=generateMoves(state,dice,player);
+      if(allMoves.length===0)return null;
+      if(allMoves.length===1)return allMoves[0];
+      /* Score at 0-ply and take top 8 */
+      var scored=[];
+      for(var i=0;i<allMoves.length;i++){
+        scored.push({idx:i,sc:evaluateMaster(allMoves[i].state,player)});
+      }
+      scored.sort(function(a,b){return b.sc-a.sc});
+      var topN=Math.min(8,scored.length);
+      /* 21 distinct dice rolls: (1,1)..(6,6) doubles weight 1, non-doubles weight 2 */
+      var ROLLS=[];
+      for(var d1=1;d1<=6;d1++){for(var d2=d1;d2<=6;d2++){
+        var w=d1===d2?1:2;
+        var dl=d1===d2?[d1,d1,d1,d1]:[d1,d2];
+        ROLLS.push({dice:dl,weight:w});
+      }}
+      var bestMove=null;var bestAvg=-Infinity;
+      for(var c=0;c<topN;c++){
+        var cand=allMoves[scored[c].idx];
+        var totalScore=0;
+        for(var r=0;r<ROLLS.length;r++){
+          var roll=ROLLS[r];
+          var oppMoves=generateMoves(cand.state,roll.dice,opp);
+          /* Opponent picks their best response */
+          var oppBestScore=-Infinity;var oppBestState=cand.state;
+          if(oppMoves.length===0){
+            oppBestState=cand.state;
+            oppBestScore=evaluateMaster(cand.state,player);
+          }else{
+            /* If too many opponent moves, prune to top 15 */
+            var evalPool=oppMoves;
+            if(oppMoves.length>15){
+              var oppScored=[];
+              for(var m=0;m<oppMoves.length;m++)oppScored.push({idx:m,sc:evaluateMaster(oppMoves[m].state,opp)});
+              oppScored.sort(function(a,b){return b.sc-a.sc});
+              evalPool=[];for(var m=0;m<15;m++)evalPool.push(oppMoves[oppScored[m].idx]);
+            }
+            for(var m=0;m<evalPool.length;m++){
+              var sc=evaluateMaster(evalPool[m].state,opp);
+              if(sc>oppBestScore){oppBestScore=sc;oppBestState=evalPool[m].state}
+            }
+            /* Evaluate from player's perspective after opponent's best response */
+            oppBestScore=evaluateMaster(oppBestState,player);
+          }
+          totalScore+=oppBestScore*roll.weight;
+        }
+        var avg=totalScore/36;
+        if(avg>bestAvg){bestAvg=avg;bestMove=cand}
+      }
+      return bestMove;
+    }
+
+    /* ─── Worker Message Handler ─── */
+    self.onmessage=function(e){
+      var d=e.data;var state=d.state;var dice=d.dice;var player=d.player;var difficulty=d.difficulty;
+      var allMoves=generateMoves(state,dice,player);
+      if(allMoves.length===0){self.postMessage({moves:[],state:state});return}
+      if(allMoves.length===1){self.postMessage({moves:allMoves[0].moves,state:allMoves[0].state});return}
+      /* Rookie: random with hit bias */
+      if(difficulty==='rookie'){
+        var hitMoves=allMoves.filter(function(m){return m.state.bar[1-player]>state.bar[1-player]});
+        var pool=hitMoves.length>0&&Math.random()<0.4?hitMoves:allMoves;
+        var pick=pool[Math.floor(Math.random()*pool.length)];
+        self.postMessage({moves:pick.moves,state:pick.state});return;
+      }
+      /* Master: Monte Carlo rollouts (12 rollouts × 4 candidates = 48 rollouts) */
+      if(difficulty==='master'){
+        var result=searchMC(state,dice,player,12,4,60);
+        if(result){self.postMessage({moves:result.moves,state:result.state})}
+        else{self.postMessage({moves:[],state:state})}
+        return;
+      }
+      /* Sharp: 0-ply with noise */
+      var best=null;var bestScore=-Infinity;
+      for(var i=0;i<allMoves.length;i++){
+        var sc=evaluateMaster(allMoves[i].state,player);
+        sc+=Math.random()*3;
+        if(sc>bestScore){bestScore=sc;best=allMoves[i]}
+      }
+      self.postMessage({moves:best.moves,state:best.state});
+    };
+  </script>
+
+  <script src="vendor/react.production.min.js"></script>
+  <script src="vendor/react-dom.production.min.js"></script>
+  <script src="vendor/babel.min.js"></script>
+  <script src="vendor/pixi.min.js"></script>
+
+  <script type="text/babel">
+    const {useState,useCallback,useRef,useEffect,useMemo}=React;
+
+    /* ─── Constants ─── */
+    const P={MENU:'menu',ROLLING:'rolling',MOVING:'moving',CPU_TURN:'cpu_turn',CPU_ROLLING:'cpu_rolling',DOUBLING:'doubling',GAME_OVER:'game_over',BETWEEN_GAMES:'between_games'};
+
+    function initBoard(){
+      const b=new Array(24).fill(0);
+      b[23]=2;b[12]=5;b[7]=3;b[5]=5;
+      b[0]=-2;b[11]=-5;b[16]=-3;b[18]=-5;
+      return b;
+    }
+    function initState(){return{board:initBoard(),bar:[0,0],off:[0,0]}}
+
+    /* ─── Sound Effects (Web Audio API) ─── */
+    let audioCtx=null;
+    function getAudio(){if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();return audioCtx}
+    function playTone(freq,dur,type='sine',vol=0.12){
+      try{const c=getAudio();const o=c.createOscillator();const g=c.createGain();
+      o.type=type;o.frequency.value=freq;g.gain.value=vol;
+      g.gain.exponentialRampToValueAtTime(0.001,c.currentTime+dur);
+      o.connect(g);g.connect(c.destination);o.start(c.currentTime);o.stop(c.currentTime+dur)}catch(e){}
+    }
+    /* ─── Haptic Feedback (Capacitor Haptics plugin) ─── */
+    function hapticLight(){
+      try{if(typeof Capacitor!=='undefined'&&Capacitor.Plugins.Haptics)Capacitor.Plugins.Haptics.impact({style:'LIGHT'})}catch(e){}
+    }
+    function hapticMedium(){
+      try{if(typeof Capacitor!=='undefined'&&Capacitor.Plugins.Haptics)Capacitor.Plugins.Haptics.impact({style:'MEDIUM'})}catch(e){}
+    }
+    function hapticHeavy(){
+      try{if(typeof Capacitor!=='undefined'&&Capacitor.Plugins.Haptics)Capacitor.Plugins.Haptics.impact({style:'HEAVY'})}catch(e){}
+    }
+
+    function sfxRoll(){playTone(180,0.08,'square',0.08);setTimeout(()=>playTone(220,0.06,'square',0.06),40);setTimeout(()=>playTone(160,0.06,'square',0.06),80)}
+    function sfxPlace(){playTone(120,0.15,'sine',0.1)}
+    function sfxHit(){playTone(300,0.1,'sawtooth',0.1);setTimeout(()=>playTone(200,0.12,'sawtooth',0.08),50)}
+    function sfxBearOff(){playTone(500,0.12,'triangle',0.1);setTimeout(()=>playTone(700,0.12,'triangle',0.08),80)}
+    function sfxWin(){playTone(523,0.2,'square',0.08);setTimeout(()=>playTone(659,0.2,'square',0.08),150);setTimeout(()=>playTone(784,0.3,'square',0.1),300)}
+    function sfxLose(){playTone(300,0.3,'sawtooth',0.08);setTimeout(()=>playTone(220,0.4,'sawtooth',0.06),200)}
+    function sfxDouble(){playTone(440,0.15,'triangle',0.1);setTimeout(()=>playTone(550,0.15,'triangle',0.08),100)}
+
+    /* ─── Move Generation (main thread copy for training/validation) ─── */
+    function cloneState(s){return{board:s.board.slice(),bar:[s.bar[0],s.bar[1]],off:[s.off[0],s.off[1]]}}
+    function applyMove(state,from,to,player){
+      const s=cloneState(state);
+      if(from===-1){s.bar[player]--}else{if(player===0)s.board[from]--;else s.board[from]++}
+      if(to===-2||to===25){s.off[player]++;return s}
+      if(player===0){
+        if(s.board[to]===-1){s.board[to]=1;s.bar[1]++}
+        else s.board[to]++;
+      }else{
+        if(s.board[to]===1){s.board[to]=-1;s.bar[0]++}
+        else s.board[to]--;
+      }
+      return s;
+    }
+    function canLand(board,pt,player){
+      if(player===0)return board[pt]>=-1;
+      return board[pt]<=1;
+    }
+    function allInHome(state,player){
+      if(state.bar[player]>0)return false;
+      if(player===0){for(let i=6;i<24;i++)if(state.board[i]>0)return false}
+      else{for(let i=0;i<18;i++)if(state.board[i]<0)return false}
+      return true;
+    }
+    function highestOccupied(state,player){
+      if(player===0){for(let i=23;i>=0;i--)if(state.board[i]>0)return i;return -1}
+      else{for(let i=0;i<24;i++)if(state.board[i]<0)return i;return -1}
+    }
+    function countAt(board,pt,player){
+      if(player===0)return Math.max(0,board[pt]);
+      return Math.max(0,-board[pt]);
+    }
+    function playerCheckerAt(board,pt,player){
+      if(player===0)return board[pt]>0;
+      return board[pt]<0;
+    }
+    function pipCount(state,player){
+      let count=0;
+      if(player===0){
+        count+=state.bar[0]*25;
+        for(let i=0;i<24;i++)if(state.board[i]>0)count+=state.board[i]*(i+1);
+      }else{
+        count+=state.bar[1]*25;
+        for(let i=0;i<24;i++)if(state.board[i]<0)count+=(-state.board[i])*(24-i);
+      }
+      return count;
+    }
+
+    function generateMoves(state,dice,player){
+      const results=[];
+      function recurse(st,remaining,moves){
+        if(remaining.length===0){results.push({state:st,moves:moves});return}
+        const die=remaining[0];const rest=remaining.slice(1);
+        let found=false;
+        if(st.bar[player]>0){
+          const target=player===0?24-die:die-1;
+          if(target>=0&&target<24&&canLand(st.board,target,player)){
+            const ns=applyMove(st,-1,target,player);
+            found=true;
+            recurse(ns,rest,moves.concat([{from:-1,to:target,die}]));
+          }
+          if(!found)recurse(st,rest,moves);
+          return;
+        }
+        const inHome=allInHome(st,player);
+        const pts=[];
+        for(let i=0;i<24;i++){
+          if(playerCheckerAt(st.board,i,player)){
+            let target;
+            if(player===0)target=i-die;else target=i+die;
+            if(target>=0&&target<24){
+              if(canLand(st.board,target,player)){pts.push({from:i,to:target});found=true}
+            } else if(inHome){
+              if(player===0&&target<0){
+                if(target===-1||i>=highestOccupied(st,player)){
+                  pts.push({from:i,to:-2});found=true;
+                }
+              }
+              if(player===1&&target>=24){
+                if(target===24||i<=highestOccupied(st,player)){
+                  pts.push({from:i,to:25});found=true;
+                }
+              }
+            }
+          }
+        }
+        if(!found){recurse(st,rest,moves);return}
+        for(const mv of pts){
+          const ns=applyMove(st,mv.from,mv.to,player);
+          recurse(ns,rest,moves.concat([{from:mv.from,to:mv.to,die}]));
+        }
+      }
+      const diceList=dice.slice();
+      recurse(state,diceList,[]);
+      if(diceList.length===2&&diceList[0]!==diceList[1]){
+        recurse(state,[diceList[1],diceList[0]],[]);
+      }
+      let maxLen=0;
+      for(const r of results)if(r.moves.length>maxLen)maxLen=r.moves.length;
+      let filtered=results.filter(r=>r.moves.length===maxLen);
+      /* Backgammon rule: if only 1 die can be played and dice differ, must use larger die */
+      if(maxLen===1&&diceList.length===2&&diceList[0]!==diceList[1]){
+        const maxDie=Math.max(diceList[0],diceList[1]);
+        const withLarger=filtered.filter(r=>r.moves[0]&&r.moves[0].die===maxDie);
+        if(withLarger.length>0)filtered=withLarger;
+      }
+      const seen={};const unique=[];
+      for(const r of filtered){
+        const key=r.state.board.join(',')+';'+r.state.bar.join(',')+';'+r.state.off.join(',');
+        if(!seen[key]){seen[key]=true;unique.push(r)}
+      }
+      return unique;
+    }
+
+    /* ─── Evaluation (for training mode analysis) ─── */
+    function evaluateState(state,player){
+      return evaluateStateV2(state,player);
+    }
+
+    /* ─── Opening Moves Table (validated against XG/GNU rollouts) ─── */
+    const OPENING_MOVES = {
+      '2-1': [{from:23,to:22},{from:12,to:10}],
+      '3-1': [{from:7,to:4},{from:5,to:4}],
+      '3-2': [{from:23,to:20},{from:12,to:10}],
+      '4-1': [{from:23,to:22},{from:12,to:8}],
+      '4-2': [{from:7,to:3},{from:5,to:3}],
+      '4-3': [{from:23,to:20},{from:12,to:8}],
+      '5-1': [{from:23,to:22},{from:12,to:7}],
+      '5-2': [{from:23,to:21},{from:12,to:7}],
+      '5-3': [{from:7,to:2},{from:5,to:2}],
+      '5-4': [{from:23,to:19},{from:12,to:7}],
+      '6-1': [{from:12,to:6},{from:7,to:6}],
+      '6-2': [{from:23,to:17},{from:12,to:10}],
+      '6-3': [{from:23,to:17},{from:12,to:9}],
+      '6-4': [{from:23,to:13}],
+      '6-5': [{from:23,to:12}],
+    };
+    function isOpeningPosition(state){
+      const b=initBoard();
+      for(let i=0;i<24;i++)if(state.board[i]!==b[i])return false;
+      return state.bar[0]===0&&state.bar[1]===0&&state.off[0]===0&&state.off[1]===0;
+    }
+    function getOpeningMove(dice){
+      const key=[Math.min(dice[0],dice[1]),Math.max(dice[0],dice[1])].join('-');
+      return OPENING_MOVES[key]||null;
+    }
+
+    /* ─── Anchor quality lookup ─── */
+    const ANCHOR_VAL=[1,3,6,14,18,10]; /* 1pt,2pt,3pt,4pt,5pt(golden),bar-pt */
+
+    /* ─── Enhanced hit probability with indirect shots ─── */
+    function hitProbability(board,blotIdx,player){
+      const opp=1-player;let hits=0;
+      for(let d1=1;d1<=6;d1++){for(let d2=1;d2<=6;d2++){
+        let hit=false;
+        const dists=[d1,d2,d1+d2];
+        if(d1===d2){dists.push(d1*3);dists.push(d1*4)}
+        for(const dist of dists){
+          let from;
+          if(opp===0)from=blotIdx+dist;else from=blotIdx-dist;
+          if(from>=0&&from<24){
+            if(opp===0&&board[from]>0){hit=true;break}
+            if(opp===1&&board[from]<0){hit=true;break}
+          }
+        }
+        if(!hit&&d1!==d2){
+          const combos=[[d1,d2],[d2,d1]];
+          for(const [a,b] of combos){
+            for(let src=0;src<24;src++){
+              if(!playerCheckerAt(board,src,opp))continue;
+              let mid;
+              if(opp===0)mid=src-a;else mid=src+a;
+              if(mid<0||mid>=24)continue;
+              if(!canLand(board,mid,opp))continue;
+              let dest;
+              if(opp===0)dest=mid-b;else dest=mid+b;
+              if(dest===blotIdx){hit=true;break}
+            }
+            if(hit)break;
+          }
+        }
+        if(hit)hits++;
+      }}
+      return hits/36;
+    }
+
+    /* ─── Contact detection ─── */
+    function hasContactMT(state){
+      for(let i=0;i<24;i++){
+        if(state.board[i]>0){for(let j=i+1;j<24;j++)if(state.board[j]<0)return true}
+      }
+      return state.bar[0]>0||state.bar[1]>0;
+    }
+
+    /* ─── Race Evaluator (main thread) ─── */
+    function evaluateRaceMT(state,player){
+      const opp=1-player;
+      const myPip=pipCount(state,player);const oppPip=pipCount(state,opp);
+      let score=(oppPip-myPip)*1.4;
+      score+=state.off[player]*14;score-=state.off[opp]*14;
+      for(let i=0;i<24;i++){
+        const cnt=countAt(state.board,i,player);
+        if(cnt<=0)continue;
+        const ptVal=player===0?(i+1):(24-i);
+        if(ptVal<=6&&cnt>2)score-=(cnt-2)*(7-ptVal)*1.5;
+        if(cnt>3)score-=(cnt-3)*6;if(cnt>4)score-=(cnt-4)*8;if(cnt>5)score-=(cnt-5)*12;
+      }
+      let gaps=0;
+      if(player===0){for(let i=0;i<6;i++)if(state.board[i]<=0)gaps++}
+      else{for(let i=18;i<24;i++)if(state.board[i]>=0)gaps++}
+      if(gaps<=1)score+=5;
+      for(let i=0;i<24;i++){
+        const cnt=countAt(state.board,i,player);
+        if(cnt<=0)continue;
+        const ptVal=player===0?(i+1):(24-i);
+        if(ptVal>6)score-=cnt*Math.floor((ptVal-1)/6)*2;
+      }
+      return score;
+    }
+
+    /* ─── Contact Evaluator (main thread) ─── */
+    function evaluateContactMT(state,player){
+      const opp=1-player;
+      const myPip=pipCount(state,player);const oppPip=pipCount(state,opp);
+      let score=(oppPip-myPip)*0.4;
+      score+=state.off[player]*15;score-=state.off[opp]*15;
+      score-=state.bar[player]*28;score+=state.bar[opp]*20;
+      let blotCount=0;
+      for(let i=0;i<24;i++){
+        if(player===0&&state.board[i]===1){
+          blotCount++;
+          const prob=hitProbability(state.board,i,0);
+          const ptVal=i+1;
+          let pw;
+          if(ptVal<=6){pw=ptVal===5?2.0:ptVal===4?1.8:ptVal===6?1.5:1.0}
+          else if(ptVal<=12){pw=1.8} /* YOUR outer: high cost if hit */
+          else if(ptVal<=18){pw=0.9} /* opp outer: lower cost */
+          else{pw=0.4} /* opp home: minimal cost */
+          score-=prob*pw*22;
+        }else if(player===1&&state.board[i]===-1){
+          blotCount++;
+          const prob=hitProbability(state.board,i,1);
+          const oppPtVal=24-i;
+          let pw;
+          if(oppPtVal<=6){pw=oppPtVal===5?2.0:oppPtVal===4?1.8:oppPtVal===6?1.5:1.0}
+          else if(oppPtVal<=12){pw=1.8}
+          else if(oppPtVal<=18){pw=0.9}
+          else{pw=0.4}
+          score-=prob*pw*22;
+        }
+      }
+      if(blotCount>=2)score-=(blotCount-1)*8;
+      if(blotCount>=3)score-=(blotCount-2)*10;
+      /* Bonus for making points in key building range (5-11) */
+      if(player===0){
+        for(let i=4;i<11;i++){
+          if(state.board[i]>=2){
+            const ptValue=i+1;
+            const pointBonus=ptValue===5?6:ptValue===7?6:ptValue===8?5:ptValue===6?4:3;
+            score+=pointBonus;
+          }
+        }
+      }else{
+        for(let i=13;i<20;i++){
+          if(state.board[i]<=-2){
+            const oppPtValue=24-i;
+            const pointBonus=oppPtValue===5?6:oppPtValue===7?6:oppPtValue===8?5:oppPtValue===6?4:3;
+            score+=pointBonus;
+          }
+        }
+      }
+      let consecutive=0,bestPrime=0,primeStart=-1;
+      for(let i=0;i<24;i++){
+        if(countAt(state.board,i,player)>=2){consecutive++;if(consecutive>bestPrime){bestPrime=consecutive;primeStart=i-consecutive+1}}
+        else consecutive=0;
+      }
+      if(bestPrime>=2)score+=bestPrime*bestPrime*5;
+      if(bestPrime>=3){
+        let trapped=0;
+        for(let i=0;i<24;i++){
+          if(countAt(state.board,i,opp)>0){
+            if(player===0&&i>primeStart+bestPrime-1)trapped+=countAt(state.board,i,opp);
+            if(player===1&&i<primeStart)trapped+=countAt(state.board,i,opp);
+          }
+        }
+        score+=trapped*bestPrime*3;
+      }
+      let homePoints=0;
+      if(player===0){for(let i=0;i<6;i++)if(state.board[i]>=2)homePoints++}
+      else{for(let i=18;i<24;i++)if(state.board[i]<=-2)homePoints++}
+      const homeMultiplier=state.bar[opp]>0?10:6;
+      score+=homePoints*homeMultiplier;
+      if(homePoints===6)score+=25;
+      if(player===0){for(let i=18;i<24;i++)if(state.board[i]>=2){const oppPt=24-i;score+=ANCHOR_VAL[oppPt-1]}}
+      else{for(let i=0;i<6;i++)if(state.board[i]<=-2)score+=ANCHOR_VAL[i]}
+      for(let i=0;i<24;i++){const cnt=countAt(state.board,i,player);if(cnt>3)score-=(cnt-3)*6;if(cnt>4)score-=(cnt-4)*8;if(cnt>5)score-=(cnt-5)*12}
+      if(player===0){for(let i=4;i<12;i++){if(state.board[i]===3)score+=3}}
+      else{for(let i=12;i<20;i++){if(-state.board[i]===3)score+=3}}
+      return score;
+    }
+
+    /* ─── Main thread evaluator (dispatches race/contact) ─── */
+    function evaluateStateV2(state,player){
+      const isRace=!hasContactMT(state)&&state.bar[0]===0&&state.bar[1]===0;
+      if(isRace)return evaluateRaceMT(state,player);
+      return evaluateContactMT(state,player);
+    }
+
+    /* ─── Monte Carlo Rollouts (main thread, for training mode) ─── */
+    function pickRolloutMoveMT(state,dice,player){
+      const moves=generateMoves(state,dice,player);
+      if(moves.length===0)return null;
+      if(moves.length===1)return moves[0];
+      let best=moves[0];let bestSc=-Infinity;
+      for(const m of moves){
+        const sc=evaluateStateV2(m.state,player)+Math.random()*4;
+        if(sc>bestSc){bestSc=sc;best=m}
+      }
+      return best;
+    }
+    function rolloutResultMT(startState,nextPlayer,maxDepth){
+      let cur=cloneState(startState);
+      let p=nextPlayer;
+      for(let t=0;t<maxDepth;t++){
+        if(cur.off[0]>=15)return 0;
+        if(cur.off[1]>=15)return 1;
+        const d1=Math.floor(Math.random()*6)+1;
+        const d2=Math.floor(Math.random()*6)+1;
+        const dl=d1===d2?[d1,d1,d1,d1]:[d1,d2];
+        const r=pickRolloutMoveMT(cur,dl,p);
+        if(r)cur=r.state;
+        p=1-p;
+      }
+      return pipCount(cur,0)<pipCount(cur,1)?0:1;
+    }
+    /* Returns [{move, winRate, rollouts}] for top candidates */
+    function rolloutCandidates(state,dice,player,rollouts,topCandidates,maxDepth){
+      const allMoves=generateMoves(state,dice,player);
+      if(allMoves.length===0)return [];
+      const scored=allMoves.map((m,i)=>({m,sc:evaluateStateV2(m.state,player),idx:i}));
+      scored.sort((a,b)=>b.sc-a.sc);
+      const topN=Math.min(topCandidates,scored.length);
+      const results=[];
+      for(let c=0;c<topN;c++){
+        const move=scored[c].m;
+        let myWins=0;
+        for(let i=0;i<rollouts;i++){
+          const winner=rolloutResultMT(move.state,1-player,maxDepth||60);
+          if(winner===player)myWins++;
+        }
+        results.push({move,winRate:myWins/rollouts,rollouts,staticScore:scored[c].sc});
+      }
+      results.sort((a,b)=>b.winRate-a.winRate);
+      return results;
+    }
+
+    /* ─── Win Probability Estimation ─── */
+    function estimateWinProb(state,player){
+      const score=evaluateStateV2(state,player);
+      return 1/(1+Math.exp(-score/30));
+    }
+
+    /* ─── Gammon Probability Estimation ─── */
+    function estimateGammonProb(state,player){
+      const opp=1-player;
+      if(state.off[opp]>0)return 0.02;
+      let prob=0.15;
+      prob+=state.bar[opp]*0.10;
+      if(state.off[player]>=5)prob+=0.10;
+      if(state.off[player]>=10)prob+=0.10;
+      let con=0,bp=0;
+      for(let i=0;i<24;i++){if(countAt(state.board,i,player)>=2){con++;if(con>bp)bp=con}else con=0}
+      if(bp>=4)prob+=0.15;
+      const myPip=pipCount(state,player);const oppPip=pipCount(state,opp);
+      if(oppPip>myPip*1.5)prob+=0.10;
+      return Math.min(prob,0.60);
+    }
+
+    /* ─── Match Equity Table (16x16, Kazaross-XG2 approximation) ─── */
+    const MET=[];
+    (function(){
+      for(let i=0;i<=15;i++){MET[i]=[];for(let j=0;j<=15;j++){
+        if(i===0)MET[i][j]=1.0;
+        else if(j===0)MET[i][j]=0.0;
+        else{
+          /* Approximate MET using formula: P(win) ≈ 0.5 + 0.076*(j-i) capped [0.02,0.98] */
+          MET[i][j]=Math.max(0.02,Math.min(0.98,0.5+0.076*(j-i)));
+        }
+      }}
+    })();
+
+    /* ─── Doubling Decision Functions ─── */
+    function shouldDouble(state,player,matchScore,matchLength,cubeValue,cubeOwner,crawford){
+      if(crawford)return false;
+      if(cubeOwner!==-1&&cubeOwner!==player)return false;
+      if(cubeValue>=64)return false;
+      const wp=estimateWinProb(state,player);
+      const gp=estimateGammonProb(state,player);
+      const effectiveWin=wp+gp*0.5;
+      /* Small jitter to avoid predictability */
+      return effectiveWin>=(0.67+Math.random()*0.03);
+    }
+    function shouldTake(state,player,cubeValue){
+      const wp=estimateWinProb(state,player);
+      const gpAgainst=estimateGammonProb(state,1-player);
+      return wp>=(0.22+gpAgainst*0.15);
+    }
+
+    /* ─── Training Analysis ─── */
+    function analyzeMoves(state,dice,player){
+      const allMoves=generateMoves(state,dice,player);
+      if(allMoves.length===0)return{moves:[],best:null,confidence:null,isOpening:false};
+      const isOpening=player===0&&isOpeningPosition(state);
+      let openingMove=null;
+      if(isOpening)openingMove=getOpeningMove(dice);
+      const scored=allMoves.map((m,idx)=>{
+        const sc=evaluateStateV2(m.state,player);
+        const tags=[];
+        const hits=m.moves.filter(mv=>mv.to>=0&&mv.to<24&&(
+          (player===0&&state.board[mv.to]===-1)||(player===1&&state.board[mv.to]===1)
+        ));
+        if(hits.length>0)tags.push({label:'HIT',color:'#e74c3c',bg:'#3a1818'});
+        if(m.moves.some(mv=>mv.to===-2||mv.to===25))tags.push({label:'BEAR OFF',color:'#f0c040',bg:'#3a3018'});
+        let con=0,best=0;
+        for(let i=0;i<24;i++){if(countAt(m.state.board,i,player)>=2){con++;if(con>best)best=con}else con=0}
+        let oldCon=0,oldBest=0;
+        for(let i=0;i<24;i++){if(countAt(state.board,i,player)>=2){oldCon++;if(oldCon>oldBest)oldBest=oldCon}else oldCon=0}
+        if(best>oldBest&&best>=3)tags.push({label:'PRIME',color:'#9b59b6',bg:'#2a1830'});
+        let blots=0;
+        for(let i=0;i<24;i++){if(player===0&&m.state.board[i]===1)blots++;if(player===1&&m.state.board[i]===-1)blots++}
+        let oldBlots=0;
+        for(let i=0;i<24;i++){if(player===0&&state.board[i]===1)oldBlots++;if(player===1&&state.board[i]===-1)oldBlots++}
+        if(blots>oldBlots)tags.push({label:'EXPOSED',color:'#e67e22',bg:'#302010'});
+        if(blots<oldBlots)tags.push({label:'SAFE',color:'#27ae60',bg:'#1a3018'});
+        let hp=0,ohp=0;
+        if(player===0){for(let i=0;i<6;i++){if(m.state.board[i]>=2)hp++;if(state.board[i]>=2)ohp++}}
+        if(hp>ohp)tags.push({label:'ANCHOR',color:'#3498db',bg:'#182a38'});
+        /* MAKE POINT: detect newly-made points in the building range (5-11) */
+        let madeOuterPoint=false;
+        if(player===0){
+          for(let i=4;i<11;i++){
+            if(m.state.board[i]>=2&&state.board[i]<2){madeOuterPoint=true;break}
+          }
+        }else{
+          for(let i=13;i<20;i++){
+            if(m.state.board[i]<=-2&&state.board[i]>-2){madeOuterPoint=true;break}
+          }
+        }
+        if(madeOuterPoint)tags.push({label:'MAKE POINT',color:'#2ecc71',bg:'#0f2818'});
+        const slots=m.moves.filter(mv=>mv.to>=0&&mv.to<24&&countAt(m.state.board,mv.to,player)===1);
+        if(slots.length>0&&tags.every(t=>t.label!=='EXPOSED'))tags.push({label:'SLOT',color:'#8e44ad',bg:'#281830'});
+        let isBookMove=false;
+        if(openingMove){
+          const bookSet=openingMove.map(bm=>bm.from+'>'+bm.to).sort().join(',');
+          const thisSet=m.moves.map(mv=>mv.from+'>'+mv.to).sort().join(',');
+          if(bookSet===thisSet)isBookMove=true;
+        }
+        if(isBookMove)tags.unshift({label:'BOOK',color:'#f0c040',bg:'#3a3018'});
+        return{...m,score:sc,tags,idx,isBookMove};
+      });
+      scored.sort((a,b)=>b.score-a.score);
+      if(openingMove){
+        const bookIdx=scored.findIndex(s=>s.isBookMove);
+        if(bookIdx>0){const bookMove=scored.splice(bookIdx,1)[0];scored.unshift(bookMove)}
+      }
+      /* For non-opening positions: re-rank top candidates by Monte Carlo rollouts */
+      let usedRollouts=false;
+      let totalRollouts=0;
+      if(!openingMove&&scored.length>=2){
+        const ROLLOUTS_PER_MOVE=40;
+        const TOP_N=Math.min(6,scored.length);
+        const rolloutResults=[];
+        for(let c=0;c<TOP_N;c++){
+          const mv=scored[c];
+          let myWins=0;
+          for(let i=0;i<ROLLOUTS_PER_MOVE;i++){
+            const winner=rolloutResultMT(mv.state,1-player,60);
+            if(winner===player)myWins++;
+          }
+          rolloutResults.push({...mv,winRate:myWins/ROLLOUTS_PER_MOVE,rollouts:ROLLOUTS_PER_MOVE});
+        }
+        rolloutResults.sort((a,b)=>b.winRate-a.winRate);
+        /* Replace top N in scored with rollout-ranked versions */
+        for(let c=0;c<TOP_N;c++)scored[c]=rolloutResults[c];
+        usedRollouts=true;
+        totalRollouts=ROLLOUTS_PER_MOVE*TOP_N;
+      }
+      let confidence=null;
+      if(scored.length>=2){
+        if(isOpening&&scored[0].isBookMove){
+          confidence={level:'high',label:'Book Move',color:'#f0c040',detail:'Established best play per computer rollout analysis'};
+        }else if(usedRollouts){
+          /* Confidence based on win rate gap */
+          const wr1=scored[0].winRate||0;const wr2=scored[1].winRate||0;
+          const wrGap=wr1-wr2;
+          if(wrGap>=0.15){
+            confidence={level:'high',label:'Clear Best',color:'#27ae60',detail:'Best move wins '+Math.round(wr1*100)+'% vs #2: '+Math.round(wr2*100)+'%'};
+          }else if(wrGap>=0.06){
+            confidence={level:'medium',label:'Slight Edge',color:'#e67e22',detail:Math.round(wr1*100)+'% vs '+Math.round(wr2*100)+'% ('+totalRollouts+' rollouts)'};
+          }else{
+            confidence={level:'low',label:'Close Call',color:'#e74c3c',detail:'Top moves nearly equal: '+Math.round(wr1*100)+'% vs '+Math.round(wr2*100)+'%'};
+          }
+        }else{
+          const gap=scored[0].score-scored[1].score;
+          const maxScore=Math.max(Math.abs(scored[0].score),1);
+          const relGap=gap/maxScore;
+          if(relGap>0.15||gap>15){
+            confidence={level:'high',label:'Clear Best',color:'#27ae60',detail:'Best move leads by '+Math.round(gap)+' points'};
+          }else if(relGap>0.05||gap>5){
+            confidence={level:'medium',label:'Slight Edge',color:'#e67e22',detail:'Top moves differ by only '+Math.round(gap)+' points'};
+          }else{
+            confidence={level:'low',label:'Close Call',color:'#e74c3c',detail:'Several moves score nearly equal (gap: '+Math.round(gap)+')'};
+          }
+        }
+      }else if(scored.length===1){
+        confidence={level:'high',label:'Only Move',color:'#27ae60',detail:'Only one legal move available'};
+      }
+      return{moves:scored,best:scored[0],confidence,isOpening,usedRollouts,totalRollouts};
+    }
+
+    /* ─── Server-based Analysis (gnubg via bgweb-api) ─── */
+    /* Set this to your deployed Fly.io URL after deploying the server.
+       Example: 'https://backgammon-ai.fly.dev'
+       Leave empty to disable server analysis (uses local rollouts only). */
+    const ANALYSIS_SERVER_URL='https://esbro-bg-ai.fly.dev';
+
+    /* Convert our state {board[24], bar[2], off[2]} to bgweb-api format.
+       bgweb-api uses per-player point counts: { x: {1: n, 2: n, ...}, o: {1: n, ...} }
+       'x' is the player on roll. We always pass our state with player as 'x'. */
+    function toBgwebBoard(state,player){
+      const x={};const o={};
+      /* For player 0: their point N (1-24) corresponds to board index (N-1).
+         For player 1: their point N corresponds to board index (24-N). */
+      for(let i=0;i<24;i++){
+        const v=state.board[i];
+        if(v===0)continue;
+        if(player===0){
+          /* Our player 0 = bgweb's 'x' */
+          if(v>0){x[String(i+1)]=v}
+          else{o[String(24-i)]=-v}
+        }else{
+          /* Our player 1 = bgweb's 'x' (we pass state from p1 perspective) */
+          if(v<0){x[String(24-i)]=-v}
+          else{o[String(i+1)]=v}
+        }
+      }
+      /* Bar: bgweb uses point "bar" — but in CheckerLayout it's just 25 in some versions.
+         We use the openapi standard: not always defined, omit if 0 */
+      const myBar=player===0?state.bar[0]:state.bar[1];
+      const oppBar=player===0?state.bar[1]:state.bar[0];
+      if(myBar>0)x['bar']=myBar;
+      if(oppBar>0)o['bar']=oppBar;
+      return{x,o};
+    }
+
+    /* Convert bgweb-api move (from/to as point numbers) back to our format (board indices).
+       For player 0: from index = (fromPoint - 1), to index = (toPoint - 1)
+       For player 1: from index = (24 - fromPoint), to index = (24 - toPoint)
+       BAR/off handled specially. */
+    function fromBgwebMove(from,to,player){
+      let fromIdx,toIdx;
+      if(from==='bar')fromIdx=-1;
+      else if(player===0)fromIdx=parseInt(from,10)-1;
+      else fromIdx=24-parseInt(from,10);
+      if(to==='off')toIdx=player===0?-2:25;
+      else if(player===0)toIdx=parseInt(to,10)-1;
+      else toIdx=24-parseInt(to,10);
+      return{from:fromIdx,to:toIdx};
+    }
+
+    /* Returns final state after applying a sequence of moves */
+    function applyMovesSequence(state,moves,player){
+      let s=state;
+      for(const mv of moves){
+        s=applyMove(s,mv.from,mv.to,player);
+      }
+      return s;
+    }
+
+    /* In-memory cache for server analysis: key = positionHash + dice */
+    const serverAnalysisCache=new Map();
+    function cacheKey(state,dice,player){
+      return state.board.join(',')+';'+state.bar.join(',')+';'+state.off.join(',')+';'+dice.slice().sort().join('-')+';p'+player;
+    }
+
+    /* Async: get analysis from server. Returns null on failure. */
+    async function analyzeMovesServer(state,dice,player){
+      if(!ANALYSIS_SERVER_URL)return null;
+      const k=cacheKey(state,dice,player);
+      if(serverAnalysisCache.has(k))return serverAnalysisCache.get(k);
+      try{
+        const board=toBgwebBoard(state,player);
+        const body={
+          board,
+          dice:[dice[0],dice[1]||dice[0]], /* doubles use 4 dice but bgweb expects 2 */
+          player:'x',
+          'max-moves':6,
+          'score-moves':true,
+          cubeful:false,
+        };
+        const ctrl=new AbortController();
+        const timeoutId=setTimeout(()=>ctrl.abort(),5000);
+        const resp=await fetch(ANALYSIS_SERVER_URL+'/api/v1/getmoves',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify(body),
+          signal:ctrl.signal,
+        });
+        clearTimeout(timeoutId);
+        if(!resp.ok)throw new Error('Server returned '+resp.status);
+        const data=await resp.json();
+        if(!Array.isArray(data)||data.length===0)return null;
+        /* Convert each bgweb move to our format */
+        const scored=data.map((m,idx)=>{
+          const ourMoves=m.play.map(p=>fromBgwebMove(p.from,p.to,player));
+          const finalState=applyMovesSequence(state,ourMoves,player);
+          const eq=m.evaluation?.eq||0;
+          const prob=m.evaluation?.probability||{};
+          const winRate=(prob.win||0.5);
+          const tags=[];
+          if(idx===0)tags.push({label:'GNUBG',color:'#3498db',bg:'#0e2a40'});
+          /* Add basic tags by inspecting the move */
+          if(ourMoves.some(mv=>mv.to===-2||mv.to===25))tags.push({label:'BEAR OFF',color:'#f0c040',bg:'#3a3018'});
+          const wasHit=ourMoves.some(mv=>mv.to>=0&&mv.to<24&&(
+            (player===0&&state.board[mv.to]===-1)||(player===1&&state.board[mv.to]===1)
+          ));
+          if(wasHit)tags.push({label:'HIT',color:'#e74c3c',bg:'#3a1818'});
+          return{
+            moves:ourMoves,state:finalState,score:eq*100,
+            tags,winRate,equity:eq,probability:prob,idx,
+          };
+        });
+        let confidence=null;
+        if(scored.length>=2){
+          const eqGap=scored[0].equity-scored[1].equity;
+          if(eqGap>=0.05){
+            confidence={level:'high',label:'Clear Best',color:'#27ae60',detail:'Equity advantage: +'+eqGap.toFixed(3)};
+          }else if(eqGap>=0.015){
+            confidence={level:'medium',label:'Slight Edge',color:'#e67e22',detail:'Small equity advantage: +'+eqGap.toFixed(3)};
+          }else{
+            confidence={level:'low',label:'Close Call',color:'#e74c3c',detail:'Equity nearly equal'};
+          }
+        }
+        const result={moves:scored,best:scored[0],confidence,isOpening:false,usedRollouts:false,usedServer:true};
+        serverAnalysisCache.set(k,result);
+        if(serverAnalysisCache.size>100){
+          /* Trim cache to last 50 */
+          const keys=Array.from(serverAnalysisCache.keys()).slice(0,-50);
+          for(const dk of keys)serverAnalysisCache.delete(dk);
+        }
+        return result;
+      }catch(e){
+        console.warn('Server analysis failed:',e.message);
+        return null;
+      }
+    }
+
+    /* Combined analysis: try server first, fall back to local rollouts */
+    async function analyzeMovesAsync(state,dice,player,useServer){
+      if(useServer&&ANALYSIS_SERVER_URL){
+        const serverResult=await analyzeMovesServer(state,dice,player);
+        if(serverResult)return serverResult;
+      }
+      return analyzeMoves(state,dice,player);
+    }
+
+    function getStrategyExplanation(analysis,state,player){
+      if(!analysis.best)return['No legal moves available.'];
+      const b=analysis.best;
+      const tags=b.tags.map(t=>t.label);
+      const moves=b.moves;
+      const reasons=[];
+      const opp=1-player;
+      if(tags.includes('BOOK')){
+        const makePoint=moves.length===2&&moves[0].to===moves[1].to;
+        if(makePoint){
+          const ptName=moves[0].to+1;
+          const pointNames={5:'5-point (the most valuable point)',4:'4-point (a strong inner-board point)',3:'3-point (an inner-board point)',7:'bar point (blocks opponents escaping)'};
+          reasons.push('Book move: Make your '+(pointNames[ptName]||ptName+'-point')+'.');
+          reasons.push('Making a new point with both dice is always best when possible.');
+        }else if(moves.length===1){
+          const dist=moves[0].from-moves[0].to;
+          if(dist===11)reasons.push('Book move: "Lover\'s Leap" — run a back checker to the midpoint.');
+          else if(dist===10)reasons.push('Book move: Run a back checker to point 14.');
+          else reasons.push('Book move: Run a back checker.');
+        }else{
+          const splitMove=moves.find(m=>m.from===23);
+          const buildMove=moves.find(m=>m.from===12||m.from===7||m.from===5);
+          if(splitMove&&buildMove){
+            reasons.push('Book move: Split to the '+(splitMove.to+1)+'-point while building to the '+(buildMove.to+1)+'-point.');
+          }else{
+            reasons.push('Book move: Develop both sides of the board.');
+          }
+        }
+        return reasons;
+      }
+      let contact=false;
+      for(let i=0;i<24;i++){
+        if(playerCheckerAt(state.board,i,player)){
+          if(player===0){for(let j=i+1;j<24;j++)if(state.board[j]<0){contact=true;break}}
+          else{for(let j=0;j<i;j++)if(state.board[j]>0){contact=true;break}}
+        }
+        if(contact)break;
+      }
+      const isRace=!contact&&state.bar[0]===0&&state.bar[1]===0;
+      const myPip=pipCount(state,player);const oppPip=pipCount(state,opp);
+      if(tags.includes('BEAR OFF')){
+        const bearCount=moves.filter(m=>m.to===-2||m.to===25).length;
+        if(bearCount>=2)reasons.push('Bear off '+bearCount+' checkers this turn.');
+        else reasons.push('Bear off a checker to keep your race moving.');
+        if(isRace){
+          const pipLead=oppPip-myPip;
+          if(pipLead>0)reasons.push('You\'re leading the race by '+pipLead+' pips.');
+          else if(pipLead<0)reasons.push('You\'re behind by '+(-pipLead)+' pips.');
+        }
+        const resultOff=b.state.off[player];const remaining=15-resultOff;
+        if(remaining<=4)reasons.push('Only '+remaining+' checker'+(remaining===1?'':'s')+' left to bear off.');
+        return reasons;
+      }
+      if(tags.includes('HIT')){
+        const hitPoints=moves.filter(mv=>mv.to>=0&&mv.to<24&&(
+          (player===0&&state.board[mv.to]===-1)||(player===1&&state.board[mv.to]===1)
+        ));
+        const hitPt=hitPoints[0]?hitPoints[0].to+1:'';
+        reasons.push('Hit the opponent\'s blot on point '+hitPt+'.');
+        if(state.bar[opp]===0){
+          let hp=0;
+          if(player===0){for(let i=0;i<6;i++)if(state.board[i]>=2)hp++}
+          else{for(let i=18;i<24;i++)if(state.board[i]<=-2)hp++}
+          if(hp>=3)reasons.push('With '+hp+' home board points, re-entry will be tough for them.');
+          else reasons.push('Hitting costs the opponent a full turn to re-enter.');
+        }else{
+          reasons.push('The opponent already has a checker on the bar — adding another makes re-entry harder.');
+        }
+        if(tags.includes('PRIME'))reasons.push('This also extends your prime.');
+      }
+      if(tags.includes('PRIME')&&!tags.includes('HIT')){
+        let con=0,best=0;
+        for(let i=0;i<24;i++){if(countAt(b.state.board,i,player)>=2){con++;if(con>best)best=con}else con=0}
+        reasons.push('Extend your prime to '+best+' consecutive points.');
+        if(best>=4)reasons.push('A '+best+'-point prime is a serious blockade.');
+        else if(best===3)reasons.push('A 3-prime starts limiting the opponent\'s escape routes.');
+      }
+      if(tags.includes('ANCHOR')){
+        let hp=0;
+        if(player===0){for(let i=0;i<6;i++)if(b.state.board[i]>=2)hp++}
+        reasons.push('Make a new home board point, giving you '+hp+' of 6.');
+      }
+      if(tags.includes('SAFE')&&reasons.length===0){
+        let blotsBefore=0,blotsAfter=0;
+        for(let i=0;i<24;i++){
+          if(player===0){if(state.board[i]===1)blotsBefore++;if(b.state.board[i]===1)blotsAfter++}
+        }
+        const reduced=blotsBefore-blotsAfter;
+        reasons.push('Cover '+reduced+' blot'+(reduced===1?'':'s')+', reducing your exposure.');
+      }
+      if(tags.includes('EXPOSED')&&reasons.length===0){
+        reasons.push('This move leaves a blot, but it\'s the best option available.');
+        for(const mv of moves){
+          if(mv.to>=0&&mv.to<24&&countAt(b.state.board,mv.to,player)===1&&countAt(state.board,mv.to,player)!==1){
+            const prob=hitProbability(b.state.board,mv.to,player);
+            if(prob>0){
+              reasons.push('The blot on point '+(mv.to+1)+' has a '+Math.round(prob*100)+'% chance of being hit.');
+              if(prob<0.2)reasons.push('That\'s a relatively low risk.');
+              else if(prob>0.4)reasons.push('That\'s high risk, but alternatives score worse.');
+            }
+          }
+        }
+      }
+      if(tags.includes('SLOT')&&reasons.length===0){
+        const slotted=moves.find(mv=>mv.to>=0&&mv.to<24&&countAt(b.state.board,mv.to,player)===1);
+        if(slotted){
+          const prob=hitProbability(b.state.board,slotted.to,player);
+          reasons.push('Slot point '+(slotted.to+1)+' — place a lone checker to try to make this point next turn.');
+          reasons.push('If the opponent misses ('+Math.round((1-prob)*100)+'% chance), you can cover it next turn.');
+        }
+      }
+      if(reasons.length===0&&isRace){
+        reasons.push('Pure race — move your checkers home efficiently.');
+        const pipLead=oppPip-myPip;
+        if(pipLead>15)reasons.push('You have a comfortable '+pipLead+'-pip lead.');
+        else if(pipLead>0)reasons.push('You lead by '+pipLead+' pips.');
+        else if(pipLead<0)reasons.push('You trail by '+(-pipLead)+' pips.');
+      }
+      if(reasons.length===0){
+        if(contact){
+          if(myPip<oppPip)reasons.push('Maintain your pip lead while keeping your position secure.');
+          else reasons.push('Improve your position while minimizing blot exposure.');
+        }else{
+          reasons.push('Advance your checkers toward home.');
+        }
+      }
+      return reasons;
+    }
+
+    /* ═══════════════════════════════════════════════════════════
+       PixiJS Board Renderer
+       ═══════════════════════════════════════════════════════════ */
+
+    // ─── Skin System ───
+    const SKINS={
+      ivory:{
+        name:'Ivory',swatch:'#f0e8d0',
+        canvasBg:0xf8f0d8,
+        boardBg:0xb89868,boardBgLight:0xd4b888,boardBorder:0x8a6838,
+        pointDark:0x6a4828,pointLight:0xe8d8a8,
+        barBg:0x6a4828,
+        playerChecker:0xfaf4e0,playerCheckerLight:0xffffff,
+        cpuChecker:0x3a2010,cpuCheckerLight:0x6a4828,
+        playerBorder:0xb8a070,cpuBorder:0x2a1808,
+        selectGlow:0xc89030,validGlow:0x70a040,bestGlow:0x70b050,
+        midLine:0x6a4828,bearOffBg:0xf0e0c0,
+        uiBg1:'#f0e8d0',uiBg2:'#e8dcc0',
+        uiText:'#3a2818',uiTextDim:'#7a5838',uiAccent:'#7a4818',
+        uiAccentBright:'#a04818', /* used for emphasis buttons like DOUBLE */
+        uiPanel:'rgba(248,240,216,0.92)',uiPanelBorder:'#a8804c',
+        uiBtnActive:'linear-gradient(135deg,#8a5828,#b88848,#8a5828)',uiBtnPassive:'rgba(200,168,124,0.5)',
+        uiBtnActiveText:'#fcf4e0',uiTitleShadow:'0 0 18px rgba(122,72,24,0.15),2px 2px 0 #c8a878',
+      },
+      walnut:{
+        name:'Walnut',swatch:'#d4b896',
+        canvasBg:0xe8d8b8,
+        boardBg:0x6b4a2a,boardBgLight:0x8a6840,boardBorder:0x4a3018,
+        pointDark:0x4a2812,pointLight:0xd8b878,
+        barBg:0x3a2010,
+        playerChecker:0xfaf0d8,playerCheckerLight:0xfff8e8,
+        cpuChecker:0x2a1808,cpuCheckerLight:0x4a3018,
+        playerBorder:0xc8b888,cpuBorder:0x1a0e04,
+        selectGlow:0xc88830,validGlow:0x60a040,bestGlow:0x70b050,
+        midLine:0x3a2010,bearOffBg:0xd4b896,
+        uiBg1:'#d4b896',uiBg2:'#c8a878',
+        uiText:'#3a2818',uiTextDim:'#7a5838',uiAccent:'#5a3a18',
+        uiAccentBright:'#8a3a18',
+        uiPanel:'rgba(232,216,184,0.92)',uiPanelBorder:'#8a6838',
+        uiBtnActive:'linear-gradient(135deg,#6a4828,#8a6838,#6a4828)',uiBtnPassive:'rgba(180,148,100,0.6)',
+        uiBtnActiveText:'#f8f0d8',uiTitleShadow:'0 0 20px rgba(90,58,24,0.2),2px 2px 0 #b8946c',
+      },
+      classic:{
+        name:'Classic',swatch:'#3a2210',
+        // PixiJS board colors
+        canvasBg:0x1a0e07,
+        boardBg:0x3a2210,boardBgLight:0x5a3a20,boardBorder:0x6b4a2a,
+        pointDark:0x5a3018,pointLight:0xc8a870,
+        barBg:0x2a1808,
+        playerChecker:0xdaa557,playerCheckerLight:0xfff8e0,
+        cpuChecker:0x3a2218,cpuCheckerLight:0x6a4a3a,
+        playerBorder:0xc8a050,cpuBorder:0x4a3020,
+        selectGlow:0xf0c040,validGlow:0x60c060,bestGlow:0x60dc60,
+        midLine:0x6b4a2a,bearOffBg:0x1a0e07,
+        // CSS UI colors
+        uiBg1:'#1a0e07',uiBg2:'#2d1810',
+        uiText:'#e8d5a3',uiTextDim:'#8a7a5a',uiAccent:'#daa557',
+        uiAccentBright:'#f0c040',
+        uiPanel:'rgba(42,26,14,0.85)',uiPanelBorder:'#5a3a20',
+        uiBtnActive:'linear-gradient(135deg,#c0952a,#daa557,#c0952a)',uiBtnPassive:'rgba(90,58,32,0.5)',
+        uiBtnActiveText:'#1a0e07',uiTitleShadow:'0 0 30px rgba(218,165,87,0.3),2px 2px 0 #5a3a20',
+      },
+      emerald:{
+        name:'Emerald',swatch:'#2a4a30',
+        canvasBg:0x141e14,
+        boardBg:0x2a4a30,boardBgLight:0x3a5a38,boardBorder:0x4a6040,
+        pointDark:0x2a3a20,pointLight:0xa89868,
+        barBg:0x1a2a18,
+        playerChecker:0xf0e8c8,playerCheckerLight:0xfff8e8,
+        cpuChecker:0x1a3018,cpuCheckerLight:0x3a4a30,
+        playerBorder:0xd0c890,cpuBorder:0x2a3a20,
+        selectGlow:0xd0c070,validGlow:0x70a060,bestGlow:0x70b060,
+        midLine:0x4a5a3a,bearOffBg:0x141e14,
+        uiBg1:'#141e14',uiBg2:'#1e2a1c',
+        uiText:'#d8d0b8',uiTextDim:'#7a7a60',uiAccent:'#b8a868',
+        uiAccentBright:'#e8c878',
+        uiPanel:'rgba(20,30,20,0.85)',uiPanelBorder:'#4a5a3a',
+        uiBtnActive:'linear-gradient(135deg,#8a7a40,#b8a868,#8a7a40)',uiBtnPassive:'rgba(40,50,30,0.5)',
+        uiBtnActiveText:'#141e14',uiTitleShadow:'0 0 20px rgba(184,168,104,0.2),2px 2px 0 #2a3a20',
+      },
+      rose:{
+        name:'Rose',swatch:'#3a2028',
+        canvasBg:0x1a1014,
+        boardBg:0x3a2028,boardBgLight:0x4a2a34,boardBorder:0x5a3840,
+        pointDark:0x3a1820,pointLight:0xb89888,
+        barBg:0x2a1820,
+        playerChecker:0xf0e0c8,playerCheckerLight:0xfff4e8,
+        cpuChecker:0x2a1018,cpuCheckerLight:0x4a2830,
+        playerBorder:0xd0b8a0,cpuBorder:0x3a2028,
+        selectGlow:0xd0a878,validGlow:0x80a870,bestGlow:0x80b870,
+        midLine:0x5a3840,bearOffBg:0x1a1014,
+        uiBg1:'#1a1014',uiBg2:'#28181e',
+        uiText:'#e0d0c8',uiTextDim:'#8a7068',uiAccent:'#c8a088',
+        uiAccentBright:'#f0c0a0',
+        uiPanel:'rgba(26,16,20,0.85)',uiPanelBorder:'#5a3840',
+        uiBtnActive:'linear-gradient(135deg,#a07858,#c8a088,#a07858)',uiBtnPassive:'rgba(60,30,40,0.5)',
+        uiBtnActiveText:'#1a1014',uiTitleShadow:'0 0 20px rgba(200,160,136,0.2),2px 2px 0 #3a1820',
+      },
+      midnight:{
+        name:'Midnight',swatch:'#182030',
+        canvasBg:0x0c1018,
+        boardBg:0x182030,boardBgLight:0x222a3a,boardBorder:0x384050,
+        pointDark:0x141a28,pointLight:0x8a8070,
+        barBg:0x101820,
+        playerChecker:0xd8c080,playerCheckerLight:0xf0e0b0,
+        cpuChecker:0x1a2030,cpuCheckerLight:0x303a4a,
+        playerBorder:0xc0a860,cpuBorder:0x283040,
+        selectGlow:0xc8a860,validGlow:0x70a080,bestGlow:0x70b080,
+        midLine:0x384050,bearOffBg:0x0c1018,
+        uiBg1:'#0c1018',uiBg2:'#141a24',
+        uiText:'#c8c0a8',uiTextDim:'#686058',uiAccent:'#b8a060',
+        uiAccentBright:'#f0c860',
+        uiPanel:'rgba(12,16,24,0.85)',uiPanelBorder:'#384050',
+        uiBtnActive:'linear-gradient(135deg,#8a7838,#b8a060,#8a7838)',uiBtnPassive:'rgba(30,35,50,0.5)',
+        uiBtnActiveText:'#0c1018',uiTitleShadow:'0 0 20px rgba(184,160,96,0.2),2px 2px 0 #141a28',
+      },
+    };
+    const SKIN_KEYS=Object.keys(SKINS);
+    function getSkinColors(key){return SKINS[key]||SKINS.ivory}
+
+    function BoardCanvas({gameState,uiState,onPointClick,onBarClick,onBearOffClick,scale,training,analysis,skin}){
+      const canvasRef=useRef(null);
+      const appRef=useRef(null);
+      const containersRef=useRef({});
+      const animRef=useRef(null); // for move animation
+      const animatingToRef=useRef(null); // point being animated to (hide top checker there)
+      const COL=getSkinColors(skin);
+
+      // Board dimensions — fill available space, handle portrait + landscape
+      const vw=window.innerWidth;
+      const vh=window.innerHeight;
+      const isLand=vw>vh;
+      // In landscape: board + controls sit side-by-side, so board gets ~70% of width
+      // In portrait: board uses full width, controls go below
+      const boardAreaW=isLand?Math.floor(vw-250):vw; // landscape: reserve 250px for controls panel
+      // Width constraint: TOTAL_W = BOARD_W * 1.157 + 12
+      const fromWidth=Math.floor((boardAreaW-20)/1.157);
+      // In landscape, also cap so board height fits viewport
+      const maxFromH=isLand?Math.floor((vh-90)/0.7):9999;
+      const BOARD_W=Math.min(504,fromWidth,maxFromH);
+      const POINT_W=BOARD_W/14;
+      const CHECKER_R=Math.min(16,POINT_W*0.44);
+      const BAR_W=POINT_W;
+      const BEAR_W=POINT_W*1.1;
+      const TOTAL_W=BOARD_W+BEAR_W*2+12;
+      // Height
+      const chromeH=isLand?40:250;
+      const availH=vh-chromeH;
+      const maxPointH=Math.floor((availH-30)/2);
+      const POINT_H=Math.max(BOARD_W*0.3,Math.min(maxPointH,BOARD_W*0.55));
+      const BOARD_H=POINT_H*2+30;
+      const TOTAL_H=BOARD_H+8;
+
+      // Board layout: 6 points | bar | 6 points
+      // Point columns are evenly spaced within each half
+      const COL_W=(BOARD_W-BAR_W)/12;
+      const boardLeft=BEAR_W+6;
+      function getPointX(idx){
+        // Map point index to visual position (0-5 = left half, 6-11 = right half)
+        let pos;
+        if(idx>=12){
+          // Top row: idx 12=leftmost, idx 17=left of bar, idx 18=right of bar, idx 23=rightmost
+          pos=idx-12; // 0-11
+        }else{
+          // Bottom row: idx 11=leftmost, idx 6=left of bar, idx 5=right of bar, idx 0=rightmost
+          pos=11-idx; // 0-11
+        }
+        if(pos<6){
+          // Left half
+          return boardLeft+pos*COL_W+COL_W/2;
+        }else{
+          // Right half (skip bar)
+          return boardLeft+6*COL_W+BAR_W+(pos-6)*COL_W+COL_W/2;
+        }
+      }
+      function isTopPoint(idx){return idx>=12}
+
+      // Initialize PixiJS
+      useEffect(()=>{
+        if(!canvasRef.current)return;
+        const app=new PIXI.Application();
+        let mounted=true;
+        app.init({
+          canvas:canvasRef.current,
+          width:TOTAL_W,
+          height:TOTAL_H,
+          background:COL.canvasBg,
+          antialias:true,
+          resolution:window.devicePixelRatio||2,
+          autoDensity:true,
+        }).then(()=>{
+          if(!mounted)return;
+          appRef.current=app;
+          const staticLayer=new PIXI.Container();
+          const dynamicLayer=new PIXI.Container();
+          app.stage.addChild(staticLayer);
+          app.stage.addChild(dynamicLayer);
+          containersRef.current={staticLayer,dynamicLayer};
+          drawStaticBoard(staticLayer);
+          updateDynamic();
+        });
+        return()=>{mounted=false;if(appRef.current){appRef.current.destroy(true);appRef.current=null}};
+      },[]);
+
+      // Redraw static board when skin changes
+      const prevSkinRef=useRef(skin);
+      useEffect(()=>{
+        if(prevSkinRef.current!==skin&&appRef.current){
+          prevSkinRef.current=skin;
+          appRef.current.renderer.background.color=COL.canvasBg;
+          const{staticLayer}=containersRef.current;
+          if(staticLayer)drawStaticBoard(staticLayer);
+        }
+      });
+
+      // Draw the static board (background, triangles, bar, frame)
+      function drawStaticBoard(container){
+        container.removeChildren();
+        const g=new PIXI.Graphics();
+        // Board background
+        g.roundRect(BEAR_W+2,0,BOARD_W+4,BOARD_H,8);
+        g.fill({color:COL.boardBg});
+        g.stroke({color:COL.boardBorder,width:2});
+        // Inner board glow
+        const glow=new PIXI.Graphics();
+        glow.roundRect(BEAR_W+4,2,BOARD_W,BOARD_H-4,6);
+        glow.fill({color:COL.boardBgLight,alpha:0.15});
+        container.addChild(g);
+        container.addChild(glow);
+        // Point triangles
+        for(let i=0;i<24;i++){
+          const tri=new PIXI.Graphics();
+          const dark=i%2===0;
+          const color=dark?COL.pointDark:COL.pointLight;
+          const x=getPointX(i);
+          const top=isTopPoint(i);
+          const w=COL_W*0.9;
+          if(top){
+            tri.moveTo(x-w/2,4);tri.lineTo(x+w/2,4);tri.lineTo(x,4+POINT_H);tri.closePath();
+          }else{
+            tri.moveTo(x-w/2,BOARD_H-4);tri.lineTo(x+w/2,BOARD_H-4);tri.lineTo(x,BOARD_H-4-POINT_H);tri.closePath();
+          }
+          tri.fill({color,alpha:0.7});
+          container.addChild(tri);
+        }
+        // Bar — centered between left 6 and right 6 points
+        const bar=new PIXI.Graphics();
+        const barX=boardLeft+6*COL_W+BAR_W/2;
+        bar.rect(barX-BAR_W/2,0,BAR_W,BOARD_H);
+        bar.fill({color:COL.barBg,alpha:0.9});
+        bar.stroke({color:COL.cpuBorder,width:1,alpha:0.5});
+        container.addChild(bar);
+        // Mid line
+        const mid=new PIXI.Graphics();
+        mid.rect(BEAR_W+6,BOARD_H/2-1,BOARD_W,2);
+        mid.fill({color:COL.midLine,alpha:0.4});
+        container.addChild(mid);
+        // Bear-off trays
+        for(let p=0;p<2;p++){
+          const tray=new PIXI.Graphics();
+          const tx=p===1?0:BEAR_W+BOARD_W+10;
+          tray.roundRect(tx,4,BEAR_W,BOARD_H-8,5);
+          tray.fill({color:COL.bearOffBg,alpha:0.6});
+          tray.stroke({color:COL.cpuBorder,width:1,alpha:0.5});
+          container.addChild(tray);
+        }
+      }
+
+      // Hit zones are handled via DOM overlay instead of PixiJS events for reliability
+
+      // Draw dynamic elements (checkers, highlights, labels)
+      function updateDynamic(){
+        const{dynamicLayer}=containersRef.current;
+        if(!dynamicLayer)return;
+        dynamicLayer.removeChildren();
+        const gs=gameState;
+        const ui=uiState;
+        if(!gs)return;
+
+        // Training best-move highlights — only show FIRST move of recommended sequence
+        let bestSources=new Set(),bestDests=new Set(),bestBearOff=false;
+        if(training&&analysis&&analysis.best&&analysis.best.moves.length>0){
+          const firstMv=analysis.best.moves[0];
+          if(firstMv.from>=0)bestSources.add(firstMv.from);
+          if(firstMv.to>=0&&firstMv.to<24)bestDests.add(firstMv.to);
+          if(firstMv.to===-2||firstMv.to===25)bestBearOff=true;
+        }
+
+        // Draw highlights under checkers
+        for(let i=0;i<24;i++){
+          const x=getPointX(i);
+          const top=isTopPoint(i);
+          const isSelected=ui.selected===i;
+          const isValidDest=ui.validDests.includes(i);
+          const isBestSrc=bestSources.has(i);
+          const isBestDst=bestDests.has(i);
+          if(isSelected||isValidDest||isBestSrc||isBestDst){
+            const hl=new PIXI.Graphics();
+            // Selected=gold, valid dest=green, training FROM=orange, training TO=cyan
+            let color,alpha;
+            if(isSelected){color=COL.selectGlow;alpha=0.3}
+            else if(isValidDest){color=COL.validGlow;alpha=0.25}
+            else if(isBestSrc){color=0xe08030;alpha=0.25} // orange for FROM
+            else{color=0x30a0e0;alpha=0.25} // cyan for TO
+            hl.rect(x-COL_W/2,top?2:BOARD_H/2,COL_W,BOARD_H/2-2);
+            hl.fill({color,alpha});
+            dynamicLayer.addChild(hl);
+            // Add FROM/TO labels for training highlights
+            if((isBestSrc||isBestDst)&&!isSelected&&!isValidDest){
+              const labelText=isBestSrc?'FROM':'TO';
+              const labelColor=isBestSrc?0xe08030:0x30a0e0;
+              const label=new PIXI.Text({text:labelText,style:{fontSize:Math.max(8,COL_W*0.28),fill:labelColor,fontFamily:'Georgia',fontWeight:'bold'}});
+              label.anchor.set(0.5);
+              label.x=x;label.y=top?BOARD_H/2-8:BOARD_H/2+8;
+              dynamicLayer.addChild(label);
+            }
+          }
+        }
+
+        // Determine which points have movable checkers (for hint glow)
+        const movablePoints=new Set();
+        if(gs&&ui.selected===null&&ui.phase==='moving'&&ui.currentPlayer===0){
+          // Check each player point for any valid single-die move
+          for(let i=0;i<24;i++){
+            if(gs.board[i]<=0)continue;
+            for(const die of [...new Set(ui.remainingDice||[])]){
+              const target=i-die;
+              if(target>=0&&target<24&&canLand(gs.board,target,0)){movablePoints.add(i);break}
+              if(target<0&&allInHome(gs,0)){
+                if(target===-1||i>=highestOccupied(gs,0)){movablePoints.add(i);break}
+              }
+            }
+          }
+          // Also check bar
+          if(gs.bar[0]>0)movablePoints.add(-1);
+        }
+
+        // Draw checkers on points
+        const animDest=animatingToRef.current;
+        for(let i=0;i<24;i++){
+          let count=Math.abs(gs.board[i]);
+          if(count===0)continue;
+          const isPlayer=gs.board[i]>0;
+          const x=getPointX(i);
+          const top=isTopPoint(i);
+          // Hide the top checker if it's being animated in
+          const hideTop=(animDest===i&&count>0);
+          const drawCount=hideTop?count-1:count;
+          if(drawCount===0)continue;
+          const maxShow=Math.min(drawCount,5);
+          const spacing=Math.min(CHECKER_R*1.7,POINT_H/5.5);
+          // Subtle glow on movable player checkers when nothing selected
+          if(isPlayer&&movablePoints.has(i)&&ui.selected===null){
+            const glowY=top?(10+CHECKER_R):(BOARD_H-10-CHECKER_R);
+            const glow=new PIXI.Graphics();
+            glow.circle(x,glowY,CHECKER_R+3);
+            glow.fill({color:COL.selectGlow,alpha:0.15});
+            dynamicLayer.addChild(glow);
+          }
+          for(let j=0;j<maxShow;j++){
+            const cy=top?(10+CHECKER_R+j*spacing):(BOARD_H-10-CHECKER_R-j*spacing);
+            drawChecker(dynamicLayer,x,cy,CHECKER_R,isPlayer,ui.lastMovedTo===i&&j===maxShow-1);
+          }
+          if(count>5){
+            const labelY=top?(10+CHECKER_R+4*spacing+CHECKER_R+4):(BOARD_H-10-CHECKER_R-4*spacing-CHECKER_R-4);
+            const label=new PIXI.Text({text:String(count),style:{fontSize:10*scale,fill:0xe8d5a3,fontFamily:'Georgia'}});
+            label.anchor.set(0.5);label.x=x;label.y=labelY;
+            dynamicLayer.addChild(label);
+          }
+        }
+
+        // Draw bar checkers
+        const barX=boardLeft+6*COL_W+BAR_W/2;
+        // CPU bar (top)
+        for(let j=0;j<Math.min(gs.bar[1],3);j++){
+          drawChecker(dynamicLayer,barX,20+CHECKER_R*0.8+j*CHECKER_R*1.4,CHECKER_R*0.8,false,false);
+        }
+        if(gs.bar[1]>3){
+          const label=new PIXI.Text({text:String(gs.bar[1]),style:{fontSize:9*scale,fill:0xe8d5a3,fontFamily:'Georgia'}});
+          label.anchor.set(0.5);label.x=barX;label.y=20+CHECKER_R*0.8+3*CHECKER_R*1.4;
+          dynamicLayer.addChild(label);
+        }
+        // Player bar (bottom) with highlight
+        if(ui.selected===-1){
+          const bhl=new PIXI.Graphics();
+          bhl.rect(barX-BAR_W/2,BOARD_H/2,BAR_W,BOARD_H/2);
+          bhl.fill({color:COL.selectGlow,alpha:0.25});
+          dynamicLayer.addChild(bhl);
+        }
+        for(let j=0;j<Math.min(gs.bar[0],3);j++){
+          drawChecker(dynamicLayer,barX,BOARD_H-20-CHECKER_R*0.8-j*CHECKER_R*1.4,CHECKER_R*0.8,true,false);
+        }
+        if(gs.bar[0]>3){
+          const label=new PIXI.Text({text:String(gs.bar[0]),style:{fontSize:9*scale,fill:0xe8d5a3,fontFamily:'Georgia'}});
+          label.anchor.set(0.5);label.x=barX;label.y=BOARD_H-20-CHECKER_R*0.8-3*CHECKER_R*1.4-12;
+          dynamicLayer.addChild(label);
+        }
+
+        // Bear-off trays
+        for(let p=0;p<2;p++){
+          const count=gs.off[p];
+          const tx=p===1?BEAR_W/2:BEAR_W+BOARD_W+10+BEAR_W/2;
+          const isPlayer=p===0;
+          // Highlight for valid bear-off destination
+          if(p===0&&ui.validDests.includes(-2)){
+            const bhl=new PIXI.Graphics();
+            bhl.roundRect(BEAR_W+BOARD_W+10,4,BEAR_W,BOARD_H-8,5);
+            bhl.fill({color:COL.validGlow,alpha:0.2});
+            dynamicLayer.addChild(bhl);
+          }
+          if(p===0&&bestBearOff){
+            const bhl=new PIXI.Graphics();
+            bhl.roundRect(BEAR_W+BOARD_W+10,4,BEAR_W,BOARD_H-8,5);
+            bhl.fill({color:0x4090e0,alpha:0.15});
+            dynamicLayer.addChild(bhl);
+          }
+          // Draw thin checker bars
+          for(let j=0;j<Math.min(count,12);j++){
+            const cy=isPlayer?BOARD_H-12-j*6:12+j*6;
+            const bar=new PIXI.Graphics();
+            bar.roundRect(tx-BEAR_W*0.35,cy-2,BEAR_W*0.7,4,2);
+            bar.fill({color:isPlayer?0xdaa557:0x3a2218});
+            bar.stroke({color:isPlayer?0xc8a050:0x4a3020,width:0.5});
+            dynamicLayer.addChild(bar);
+          }
+          if(count>0){
+            const numY=isPlayer?BOARD_H-12-Math.min(count,12)*6-10:12+Math.min(count,12)*6+10;
+            const label=new PIXI.Text({text:String(count),style:{fontSize:10*scale,fill:0xe8d5a3,fontFamily:'Georgia'}});
+            label.anchor.set(0.5);label.x=tx;label.y=numY;
+            dynamicLayer.addChild(label);
+          }
+        }
+
+        // Die labels on valid destinations
+        if(ui.destLabels){
+          for(const [ptStr,labels] of Object.entries(ui.destLabels)){
+            const pt=Number(ptStr);
+            if(pt===-2){
+              // Bear-off labels
+              const tx=BEAR_W+BOARD_W+10+BEAR_W/2;
+              const dieText=labels.map(l=>l.combo||String(l.die)).join(' ');
+              const label=new PIXI.Text({text:dieText,style:{fontSize:9*scale,fill:0xf0c040,fontFamily:'Georgia',fontWeight:'bold'}});
+              label.anchor.set(0.5);label.x=tx;label.y=BOARD_H/2;
+              dynamicLayer.addChild(label);
+            }else if(pt>=0&&pt<24){
+              const x=getPointX(pt);
+              const top=isTopPoint(pt);
+              const dieText=labels.map(l=>l.combo||String(l.die)).join(' ');
+              const label=new PIXI.Text({text:dieText,style:{fontSize:9*scale,fill:0xf0c040,fontFamily:'Georgia',fontWeight:'bold'}});
+              label.anchor.set(0.5);
+              label.x=x;label.y=top?BOARD_H/2-8:BOARD_H/2+8;
+              dynamicLayer.addChild(label);
+            }
+          }
+        }
+
+        // Point numbers — only in training mode
+        if(training){
+          for(let i=0;i<24;i++){
+            const x=getPointX(i);
+            const top=isTopPoint(i);
+            const label=new PIXI.Text({text:String(i+1),style:{fontSize:Math.max(7,COL_W*0.3),fill:COL.midLine,fontFamily:'Georgia'}});
+            label.anchor.set(0.5);
+            label.x=x;label.y=top?BOARD_H/2-6:BOARD_H/2+6;
+            dynamicLayer.addChild(label);
+          }
+        }
+      }
+
+      function drawChecker(container,x,y,r,isPlayer,animate){
+        const checker=new PIXI.Graphics();
+        // Shadow
+        checker.circle(x+1,y+2,r);
+        checker.fill({color:0x000000,alpha:0.3});
+        // Main body
+        checker.circle(x,y,r);
+        checker.fill({color:isPlayer?COL.playerChecker:COL.cpuChecker});
+        checker.stroke({color:isPlayer?COL.playerBorder:COL.cpuBorder,width:1.5});
+        // Inner highlight
+        checker.circle(x-r*0.25,y-r*0.25,r*0.4);
+        checker.fill({color:isPlayer?COL.playerCheckerLight:COL.cpuCheckerLight,alpha:0.3});
+        container.addChild(checker);
+      }
+
+      // Animate a checker moving from one point to another
+      function animateMove(fromPt,toPt,isPlayer){
+        const app=appRef.current;
+        if(!app)return;
+        const{dynamicLayer}=containersRef.current;
+        if(!dynamicLayer)return;
+        // Calculate source and dest positions
+        function ptPos(pt,player){
+          if(pt===-1){
+            // Bar
+            const bx=boardLeft+6*COL_W+BAR_W/2;
+            return{x:bx,y:player===0?BOARD_H-30:30};
+          }
+          if(pt===-2||pt===25){
+            // Bear off
+            const tx=player===0?BEAR_W+BOARD_W+10+BEAR_W/2:BEAR_W/2;
+            return{x:tx,y:BOARD_H/2};
+          }
+          const x=getPointX(pt);
+          const top=isTopPoint(pt);
+          // Approximate y at the tip of the stack
+          const count=Math.abs(gameState.board[pt])||1;
+          const spacing=Math.min(CHECKER_R*1.7,POINT_H/5.5);
+          const stackY=top?(10+CHECKER_R+(Math.min(count,5)-1)*spacing):(BOARD_H-10-CHECKER_R-(Math.min(count,5)-1)*spacing);
+          return{x,y:stackY};
+        }
+        const src=ptPos(fromPt,isPlayer?0:1);
+        const dst=ptPos(toPt,isPlayer?0:1);
+        // Create animated checker
+        const anim=new PIXI.Graphics();
+        const r=CHECKER_R;
+        function drawAt(x,y,lift){
+          // lift in [0,1]: 0=resting, 1=peak mid-flight (picked up)
+          const sizeScale=1.1+lift*0.10;
+          const shadowOff=2+lift*6;
+          const shadowAlpha=0.30+lift*0.18;
+          const shadowSpread=1+lift*0.15;
+          const rr=r*sizeScale;
+          anim.clear();
+          // Shadow grows and shifts to suggest height
+          anim.circle(x+1,y+shadowOff,rr*shadowSpread);anim.fill({color:0x000000,alpha:shadowAlpha});
+          anim.circle(x,y,rr);anim.fill({color:isPlayer?COL.playerChecker:COL.cpuChecker});
+          anim.stroke({color:isPlayer?COL.playerBorder:COL.cpuBorder,width:1.5});
+          anim.circle(x-rr*0.25,y-rr*0.25,rr*0.35);anim.fill({color:isPlayer?COL.playerCheckerLight:COL.cpuCheckerLight,alpha:0.3});
+        }
+        drawAt(src.x,src.y,0);
+        dynamicLayer.addChild(anim);
+        // Hide destination checker during animation
+        animatingToRef.current=(toPt>=0&&toPt<24)?toPt:null;
+        updateDynamic(); // redraw without the top checker at dest
+        dynamicLayer.addChild(anim); // re-add anim sprite on top
+        const dur=320;const start=performance.now();
+        function step(now){
+          const t=Math.min(1,(now-start)/dur);
+          // Cubic ease-out for smoother arrival
+          const ease=1-Math.pow(1-t,3);
+          const cx=src.x+(dst.x-src.x)*ease;
+          const cy=src.y+(dst.y-src.y)*ease;
+          // Lift peaks mid-flight (parabolic), 0 at endpoints
+          const lift=Math.sin(t*Math.PI);
+          drawAt(cx,cy,lift);
+          if(t<1){animRef.current=requestAnimationFrame(step)}
+          else{
+            dynamicLayer.removeChild(anim);
+            animRef.current=null;
+            animatingToRef.current=null;
+            updateDynamic(); // redraw with all checkers visible
+          }
+        }
+        if(animRef.current)cancelAnimationFrame(animRef.current);
+        animRef.current=requestAnimationFrame(step);
+      }
+
+      // Trigger move animation when moveId changes
+      const prevMoveIdRef=useRef(0);
+      useEffect(()=>{
+        if(appRef.current)updateDynamic();
+        // Check if a new move happened
+        const mid=uiState.moveId||0;
+        if(mid>prevMoveIdRef.current&&uiState.lastMoveFrom!=null&&uiState.lastMovedTo!=null){
+          prevMoveIdRef.current=mid;
+          animateMove(uiState.lastMoveFrom,uiState.lastMovedTo,uiState.lastMovePlayer===0);
+        }
+      });
+
+      // Build DOM click overlay zones on top of the canvas
+      const overlayZones=[];
+      // Point click zones
+      for(let i=0;i<24;i++){
+        const x=getPointX(i);
+        const top=isTopPoint(i);
+        const idx=i;
+        overlayZones.push(React.createElement('div',{
+          key:'pt'+i,
+          onClick:()=>onPointClick(idx),
+          style:{
+            position:'absolute',
+            left:(x-COL_W/2)+'px',
+            top:top?'0':BOARD_H/2+'px',
+            width:COL_W+'px',
+            height:BOARD_H/2+'px',
+            cursor:'pointer',
+            zIndex:3,
+          }
+        }));
+      }
+      // Bar click zone (bottom half for player)
+      const barXOverlay=boardLeft+6*COL_W+BAR_W/2;
+      overlayZones.push(React.createElement('div',{
+        key:'bar',
+        onClick:()=>onBarClick(),
+        style:{
+          position:'absolute',
+          left:(barXOverlay-BAR_W/2)+'px',
+          top:BOARD_H/2+'px',
+          width:BAR_W+'px',
+          height:BOARD_H/2+'px',
+          cursor:'pointer',
+          zIndex:2,
+        }
+      }));
+      // Player bear-off click zone (right tray)
+      overlayZones.push(React.createElement('div',{
+        key:'bearoff',
+        onClick:()=>onBearOffClick(),
+        style:{
+          position:'absolute',
+          left:(BEAR_W+BOARD_W+10)+'px',
+          top:'0',
+          width:BEAR_W+'px',
+          height:BOARD_H+'px',
+          cursor:'pointer',
+          zIndex:2,
+        }
+      }));
+
+      return React.createElement('div',{style:{position:'relative',width:TOTAL_W+'px',height:TOTAL_H+'px'}},
+        React.createElement('canvas',{
+          ref:canvasRef,
+          width:TOTAL_W,
+          height:TOTAL_H,
+          style:{
+            width:TOTAL_W+'px',
+            height:TOTAL_H+'px',
+            borderRadius:'10px',
+            touchAction:'none',
+            position:'absolute',
+            top:0,left:0,
+          }
+        }),
+        ...overlayZones,
+      );
+    }
+
+    /* ═══════════════════════════════════════════════════════════
+       Main App Component
+       ═══════════════════════════════════════════════════════════ */
+    function App(){
+      const[,forceUpdate]=useState(0);
+      const tick=useCallback(()=>forceUpdate(n=>n+1),[]);
+      const g=useRef({
+        phase:P.MENU,
+        difficulty:'sharp',
+        matchLength:5,
+        training:false,
+        gameMode:'match',
+        state:initState(),
+        dice:[],
+        diceUsed:[],
+        currentPlayer:0,
+        selected:null,
+        validDests:[],
+        turnMoves:[],
+        turnStates:[],
+        remainingDice:[],
+        allLegalMoves:[],
+        destLabels:{},
+        matchScore:[0,0],
+        cubeValue:1,
+        cubeOwner:-1,
+        crawford:false,
+        crawfordUsed:false,
+        analysis:null,
+        message:'',
+        skin:localStorage.getItem('bgSkin')||'ivory',
+        history:[],
+        animating:false,
+        diceAnim:false,
+        lastMovedTo:null,
+        lastMoveFrom:null,
+        lastMovePlayer:0,
+        moveId:0,
+        fastForward:false,
+        useServerAnalysis:localStorage.getItem('bgServerAI')!=='false', /* default ON, can be disabled */
+        serverAnalysisAvailable:null, /* null=unknown, true/false=tested */
+      }).current;
+
+      const workerRef=useRef(null);
+      useEffect(()=>{
+        const blob=new Blob([document.getElementById('ai-worker').textContent],{type:'application/javascript'});
+        workerRef.current=new Worker(URL.createObjectURL(blob));
+        return()=>workerRef.current&&workerRef.current.terminate();
+      },[]);
+
+      // Force re-render on resize/orientation change so layout recalculates
+      useEffect(()=>{
+        const onResize=()=>tick();
+        window.addEventListener('resize',onResize);
+        window.addEventListener('orientationchange',()=>setTimeout(onResize,100));
+        return()=>{window.removeEventListener('resize',onResize)};
+      },[]);
+
+      /* ─── AdMob ad unit IDs ───
+         These are Google's test IDs — replace with real ones from AdMob console before launch.
+         Test IDs always return ads but generate $0 revenue. */
+      const ADMOB_BANNER_ID = 'ca-app-pub-3940256099942544/2934735716'; // iOS test banner
+      const ADMOB_INTERSTITIAL_ID = 'ca-app-pub-3940256099942544/4411468910'; // iOS test interstitial
+
+      /* ─── Ads & IAP ─── */
+      const [adsRemoved, setAdsRemoved] = useState(() => {
+        try { return localStorage.getItem('adsRemoved') === 'true'; } catch(e) { return false; }
+      });
+      const [adMobReady, setAdMobReady] = useState(false);
+      const [interstitialLoaded, setInterstitialLoaded] = useState(false);
+      const [iapProduct, setIapProduct] = useState(null);
+      const [purchaseLoading, setPurchaseLoading] = useState(false);
+      const [showPrePrompt, setShowPrePrompt] = useState(false);
+      const prePromptResolveRef = useRef(null);
+      const [attResolved, setAttResolved] = useState(false);
+
+      // IAP product loading
+      useEffect(() => {
+        const loadProduct = async () => {
+          try {
+            if (typeof Capacitor === 'undefined') return;
+            const { NativePurchases } = Capacitor.Plugins;
+            if (!NativePurchases) return;
+            const products = await NativePurchases.getProducts({
+              productIdentifiers: ['com.esbrolabs.backgammon.removeads'],
+              productType: 'INAPP',
+            });
+            if (products && products.products && products.products.length > 0) {
+              setIapProduct(products.products[0]);
+            }
+          } catch (err) { console.error('IAP load:', err); }
+        };
+        loadProduct();
+      }, []);
+
+      // ATT prompt
+      useEffect(() => {
+        const requestATT = async () => {
+          try {
+            if (typeof Capacitor === 'undefined') { setAttResolved(true); return; }
+            const { AdMob } = Capacitor.Plugins;
+            if (!AdMob) { setAttResolved(true); return; }
+            await AdMob.initialize();
+            const trackStatus = await AdMob.trackingAuthorizationStatus();
+            if (trackStatus.status === 'notDetermined') {
+              await new Promise(resolve => {
+                prePromptResolveRef.current = resolve;
+                setShowPrePrompt(true);
+              });
+              await AdMob.requestTrackingAuthorization();
+            }
+          } catch (err) { console.warn('ATT flow:', err); }
+          setAttResolved(true);
+        };
+        requestATT();
+      }, []);
+
+      // AdMob initialization
+      useEffect(() => {
+        if (adsRemoved || !attResolved) return;
+        const initAds = async () => {
+          try {
+            if (typeof Capacitor === 'undefined') return;
+            const { AdMob } = Capacitor.Plugins;
+            if (!AdMob) return;
+            try {
+              const consent = await AdMob.requestConsentInfo();
+              if (consent.isConsentFormAvailable && consent.status === 'REQUIRED') await AdMob.showConsentForm();
+            } catch (consentErr) { console.warn('Consent flow:', consentErr); }
+            setAdMobReady(true);
+            await AdMob.prepareInterstitial({ adId: ADMOB_INTERSTITIAL_ID });
+            setInterstitialLoaded(true);
+          } catch (err) { console.error('Ad init:', err); }
+        };
+        initAds();
+      }, [adsRemoved, attResolved]);
+
+      // Banner ad lifecycle
+      useEffect(() => {
+        if (adsRemoved || !adMobReady || typeof Capacitor === 'undefined') return;
+        const { AdMob } = Capacitor.Plugins;
+        if (!AdMob) return;
+        AdMob.showBanner({ adId: ADMOB_BANNER_ID, adSize: 'BANNER', position: 'BOTTOM_CENTER', margin: 0 }).catch(() => {});
+        return () => { AdMob.hideBanner().catch(() => {}); };
+      }, [adsRemoved, adMobReady]);
+
+      const showInterstitialAd = async () => {
+        if (adsRemoved || !interstitialLoaded || typeof Capacitor === 'undefined') return;
+        try {
+          const { AdMob } = Capacitor.Plugins;
+          if (!AdMob) return;
+          await AdMob.showInterstitial();
+          AdMob.prepareInterstitial({ adId: ADMOB_INTERSTITIAL_ID })
+            .then(() => setInterstitialLoaded(true)).catch(() => setInterstitialLoaded(false));
+        } catch (err) { console.error('Interstitial:', err); }
+      };
+
+      const handleRemoveAds = async () => {
+        if (purchaseLoading || !iapProduct) return;
+        setPurchaseLoading(true);
+        try {
+          const { NativePurchases } = Capacitor.Plugins;
+          await NativePurchases.purchaseProduct({
+            productIdentifier: 'com.esbrolabs.backgammon.removeads',
+            productType: 'INAPP',
+            quantity: 1,
+          });
+          localStorage.setItem('adsRemoved', 'true');
+          setAdsRemoved(true);
+          try { const { AdMob } = Capacitor.Plugins; if (AdMob) await AdMob.removeBanner(); } catch(e) {}
+        } catch (err) { console.error('Purchase:', err); }
+        finally { setPurchaseLoading(false); }
+      };
+
+      const handleRestorePurchases = async () => {
+        if (purchaseLoading) return;
+        setPurchaseLoading(true);
+        try {
+          const { NativePurchases } = Capacitor.Plugins;
+          const result = await NativePurchases.restorePurchases();
+          const txns = result.transactions || [];
+          if (txns.some(t => t.productIdentifier === 'com.esbrolabs.backgammon.removeads')) {
+            localStorage.setItem('adsRemoved', 'true');
+            setAdsRemoved(true);
+            try { const { AdMob } = Capacitor.Plugins; if (AdMob) await AdMob.removeBanner(); } catch(e) {}
+          }
+        } catch (err) { console.error('Restore:', err); }
+        finally { setPurchaseLoading(false); }
+      };
+
+      // ─── App URLs ───
+      // Backgammon's app ID will be assigned by Apple after first submission.
+      // Until then, the manual Rate App button will fall back to the in-app StoreKit prompt.
+      const APP_STORE_URL = 'https://apps.apple.com/app/id0000000000'; // TODO: update after Apple assigns the ID
+      const APP_STORE_REVIEW_URL = 'https://apps.apple.com/app/id0000000000?action=write-review'; // TODO
+      // Esbro Labs LLC developer page (confirmed)
+      const DEVELOPER_PAGE_URL = 'https://apps.apple.com/developer/esbro-labs-llc/id1883578468';
+      const DEVELOPER_FALLBACK_URL = 'itms-apps://apps.apple.com/developer/esbro-labs-llc/id1883578468';
+
+      // Automatic review prompt — triggered after 3rd win (Apple limits to 3x/year anyway)
+      const maybeRequestReview = () => {
+        try {
+          const wins = parseInt(localStorage.getItem('bgGamesWon') || '0', 10) + 1;
+          localStorage.setItem('bgGamesWon', String(wins));
+          if (wins === 3) {
+            setTimeout(() => {
+              if (typeof Capacitor !== 'undefined') {
+                try { Capacitor.Plugins.App?.requestReview?.(); } catch(e) {}
+              }
+            }, 2000);
+          }
+        } catch(e) {}
+      };
+
+      // Manual "Rate this app" — opens review URL or triggers in-app review prompt
+      const handleRateApp = () => {
+        try {
+          // First try the native StoreKit prompt (preferred — stays in-app)
+          if (typeof Capacitor !== 'undefined' && Capacitor.Plugins.App?.requestReview) {
+            Capacitor.Plugins.App.requestReview();
+            return;
+          }
+        } catch(e) {}
+        // Fallback: open App Store review page in browser
+        try { window.open(APP_STORE_REVIEW_URL, '_blank'); } catch(e) {}
+      };
+
+      // Open developer's other apps in App Store
+      const handleMoreGames = () => {
+        try {
+          // Use itms-apps:// for direct App Store link on iOS
+          window.open(DEVELOPER_FALLBACK_URL, '_blank');
+        } catch(e) {
+          try { window.open(DEVELOPER_PAGE_URL, '_blank'); } catch(e) {}
+        }
+      };
+
+      function safeTimeout(fn,ms){setTimeout(()=>{fn();tick()},ms)}
+
+      /* ─── Dice ─── */
+      function rollDice(){return[Math.floor(Math.random()*6)+1,Math.floor(Math.random()*6)+1]}
+      function getDiceList(d){return d[0]===d[1]?[d[0],d[0],d[0],d[0]]:[d[0],d[1]]}
+
+      /* ─── Game Flow ─── */
+      function startGame(){
+        g.state=initState();g.dice=[];g.turnMoves=[];g.turnStates=[];
+        g.matchScore=[0,0];g.cubeValue=1;g.cubeOwner=-1;
+        g.crawford=false;g.crawfordUsed=false;
+        g.history=[];g.analysis=null;g.selected=null;g.message='';
+        g.lastMovedTo=null;g.animating=false;
+        startNewGame();
+      }
+      function startNewGame(){
+        g.state=initState();g.dice=[];g.turnMoves=[];g.turnStates=[];
+        g.cubeOwner=-1;g.cubeValue=1;
+        g.selected=null;g.analysis=null;g.message='';g.lastMovedTo=null;
+        doOpeningRoll();
+      }
+      function doOpeningRoll(){
+        g.phase=P.ROLLING;g.diceAnim=true;tick();
+        safeTimeout(()=>{
+          let d=rollDice();
+          while(d[0]===d[1])d=rollDice();
+          g.dice=d;g.diceAnim=false;
+          sfxRoll();
+          if(d[0]>d[1]){
+            g.currentPlayer=0;g.message='You won the opening roll!';
+            g.remainingDice=getDiceList(d);
+            beginPlayerTurn();
+          }else{
+            g.currentPlayer=1;g.message='CPU won the opening roll.';
+            g.remainingDice=getDiceList(d);
+            safeTimeout(()=>doCpuTurn(),800);
+          }
+          tick();
+        },700);
+      }
+      function beginPlayerTurn(){
+        g.phase=P.MOVING;g.turnMoves=[];g.turnStates=[cloneState(g.state)];
+        g.allLegalMoves=generateMoves(g.state,g.remainingDice,0);
+        if(g.training){
+          /* Show fast local result immediately, then update with server result if available */
+          g.analysis=analyzeMoves(g.state,g.remainingDice,0);
+          if(g.useServerAnalysis&&ANALYSIS_SERVER_URL){
+            const snapState=g.state;const snapDice=g.remainingDice.slice();
+            analyzeMovesServer(snapState,snapDice,0).then(serverResult=>{
+              /* Only update if state hasn't changed */
+              if(serverResult&&g.state===snapState&&g.training)g.analysis=serverResult;
+              tick();
+            }).catch(()=>{});
+          }
+        }
+        // No legal moves if empty or all results have 0 actual moves
+        const hasRealMoves=g.allLegalMoves.some(m=>m.moves.length>0);
+        if(!hasRealMoves){
+          g.message='No legal moves — turn passes.';
+          g.analysis=null;
+          g.phase=P.MOVING;tick();
+          safeTimeout(()=>endTurn(),1200);
+          return;
+        }
+        // Filter out empty-move results
+        g.allLegalMoves=g.allLegalMoves.filter(m=>m.moves.length>0);
+        g.selected=null;g.message='Your turn — select a checker to move.';tick();
+      }
+
+      function animateSequence(moves,idx,cb){
+        if(idx>=moves.length){cb();return}
+        const mv=moves[idx];
+        g.lastMovedTo=mv.to;g.lastMoveFrom=mv.from;g.lastMovePlayer=g.currentPlayer;g.moveId++;g.animating=true;tick();
+        if(mv.to>=0&&mv.to<24){
+          const wasHit=(g.currentPlayer===0&&g.state.board[mv.to]===-1)||(g.currentPlayer===1&&g.state.board[mv.to]===1);
+          if(wasHit){sfxHit();hapticHeavy()}else{sfxPlace();hapticLight()}
+        }else{sfxBearOff();hapticMedium()}
+        g.state=applyMove(g.state,mv.from,mv.to,g.currentPlayer);
+        safeTimeout(()=>{g.animating=false;animateSequence(moves,idx+1,cb)},400);
+      }
+
+      /* ─── Player Interaction ─── */
+      function handlePointClick(pt){
+        if(g.phase!==P.MOVING||g.currentPlayer!==0||g.animating)return;
+        if(g.selected!==null){
+          const dest=pt;
+          if(g.validDests.includes(dest)){executePlayerMove(g.selected,dest);return}
+          if(g.selected===pt){g.selected=null;g.validDests=[];g.destLabels={};tick();return}
+        }
+        if(g.state.board[pt]>0){selectChecker(pt)}
+        else{g.selected=null;g.validDests=[];g.destLabels={};tick()}
+      }
+      function handleBarClick(){
+        if(g.phase!==P.MOVING||g.currentPlayer!==0||g.animating)return;
+        if(g.state.bar[0]>0)selectChecker(-1);
+      }
+      function handleBearOffClick(){
+        if(g.phase!==P.MOVING||g.currentPlayer!==0||g.animating)return;
+        if(g.selected!==null&&g.validDests.includes(-2)){executePlayerMove(g.selected,-2)}
+      }
+      function selectChecker(pt){
+        g.selected=pt;
+        const destsMap={};
+        function addDest(dest,info){
+          const k=dest;
+          if(!destsMap[k])destsMap[k]=[];
+          const label=info.combo||String(info.die);
+          if(!destsMap[k].some(d=>(d.combo||String(d.die))===label))destsMap[k].push(info);
+        }
+        for(const die of [...new Set(g.remainingDice)]){
+          let target;
+          if(pt===-1){target=24-die}else{target=pt-die}
+          if(target>=0&&target<24&&canLand(g.state.board,target,0)){
+            addDest(target,{die,combo:null,mid:null});
+          }else if(target<0&&allInHome(g.state,0)){
+            if(target===-1||pt>=highestOccupied(g.state,0)){
+              addDest(-2,{die,combo:null,mid:null});
+            }
+          }
+        }
+        if(g.remainingDice.length>=2){
+          const uniqueDice=[...new Set(g.remainingDice)];
+          for(const die1 of uniqueDice){
+            let mid;
+            if(pt===-1){mid=24-die1}else{mid=pt-die1}
+            if(mid>=0&&mid<24&&canLand(g.state.board,mid,0)){
+              const tempState=applyMove(g.state,pt===-1?-1:pt,mid,0);
+              const remainAfter=[...g.remainingDice];
+              remainAfter.splice(remainAfter.indexOf(die1),1);
+              for(const die2 of [...new Set(remainAfter)]){
+                let target2=mid-die2;
+                if(target2>=0&&target2<24&&canLand(tempState.board,target2,0)){
+                  addDest(target2,{die:null,combo:die1+'+'+die2,mid,dies:[die1,die2]});
+                }else if(target2<0&&allInHome(tempState,0)){
+                  if(target2===-1||mid>=highestOccupied(tempState,0)){
+                    addDest(-2,{die:null,combo:die1+'+'+die2,mid,dies:[die1,die2]});
+                  }
+                }
+              }
+            }
+          }
+        }
+        g.validDests=Object.keys(destsMap).map(Number);
+        g.destLabels=destsMap;
+        if(g.validDests.length===0){g.message='No moves for this checker.';g.selected=null;g.destLabels={}}
+        else{g.message='Select destination.'}
+        tick();
+      }
+      function executePlayerMove(from,to){
+        const labels=g.destLabels&&g.destLabels[to]?g.destLabels[to]:[];
+        const dist=from===-1?24-to:from-to;
+        let singleMove=labels.find(l=>!l.combo&&g.remainingDice.includes(l.die));
+        if(!singleMove&&to===-2){
+          const exact=from+1;
+          singleMove=labels.find(l=>!l.combo);
+          if(singleMove){
+            if(g.remainingDice.includes(exact)){singleMove={die:exact,combo:null,mid:null}}
+            else{
+              const sorted=[...g.remainingDice].sort((a,b)=>a-b);
+              for(const d of sorted){if(d>=exact){singleMove={die:d,combo:null,mid:null};break}}
+            }
+          }
+        }
+        if(singleMove&&!singleMove.combo){
+          const usedDie=singleMove.die;
+          if(!g.remainingDice.includes(usedDie)){
+            g.message='Invalid move.';g.selected=null;g.validDests=[];g.destLabels={};tick();return;
+          }
+          g.turnStates.push(cloneState(g.state));
+          const wasHit=(to>=0&&to<24&&g.state.board[to]===-1);
+          g.state=applyMove(g.state,from,to,0);
+          g.lastMovedTo=to;g.lastMoveFrom=from;g.lastMovePlayer=0;g.moveId++;
+          g.remainingDice.splice(g.remainingDice.indexOf(usedDie),1);
+          g.turnMoves.push({from,to,die:usedDie});
+          if(wasHit){sfxHit();hapticHeavy()}else if(to===-2){sfxBearOff();hapticMedium()}else{sfxPlace();hapticLight()}
+          g.selected=null;g.validDests=[];g.destLabels={};
+          afterPlayerMove();
+          return;
+        }
+        const comboMove=labels.find(l=>l.combo);
+        if(comboMove&&comboMove.dies&&comboMove.mid!=null){
+          const die1=comboMove.dies[0];const die2=comboMove.dies[1];
+          const mid=comboMove.mid;
+          g.turnStates.push(cloneState(g.state));
+          const wasHit1=(mid>=0&&mid<24&&g.state.board[mid]===-1);
+          g.state=applyMove(g.state,from,mid,0);
+          g.lastMovedTo=mid;g.lastMoveFrom=from;g.lastMovePlayer=0;g.moveId++;
+          g.remainingDice.splice(g.remainingDice.indexOf(die1),1);
+          g.turnMoves.push({from,to:mid,die:die1});
+          if(wasHit1){sfxHit();hapticHeavy()}else{sfxPlace();hapticLight()}
+          g.animating=true;tick();
+          safeTimeout(()=>{
+            g.turnStates.push(cloneState(g.state));
+            const wasHit2=(to>=0&&to<24&&g.state.board[to]===-1);
+            g.state=applyMove(g.state,mid,to,0);
+            g.lastMovedTo=to;g.lastMoveFrom=mid;g.lastMovePlayer=0;g.moveId++;
+            g.remainingDice.splice(g.remainingDice.indexOf(die2),1);
+            g.turnMoves.push({from:mid,to,die:die2});
+            if(wasHit2){sfxHit();hapticHeavy()}else if(to===-2){sfxBearOff();hapticMedium()}else{sfxPlace();hapticLight()}
+            g.animating=false;
+            g.selected=null;g.validDests=[];g.destLabels={};
+            afterPlayerMove();
+          },400);
+          return;
+        }
+        const usedDie=dist;
+        if(g.remainingDice.includes(usedDie)){
+          g.turnStates.push(cloneState(g.state));
+          const wasHit=(to>=0&&to<24&&g.state.board[to]===-1);
+          g.state=applyMove(g.state,from,to,0);
+          g.lastMovedTo=to;g.lastMoveFrom=from;g.lastMovePlayer=0;g.moveId++;
+          g.remainingDice.splice(g.remainingDice.indexOf(usedDie),1);
+          g.turnMoves.push({from,to,die:usedDie});
+          if(wasHit){sfxHit();hapticHeavy()}else if(to===-2){sfxBearOff();hapticMedium()}else{sfxPlace();hapticLight()}
+          g.selected=null;g.validDests=[];g.destLabels={};
+          afterPlayerMove();
+          return;
+        }
+        g.message='Invalid move.';g.selected=null;g.validDests=[];g.destLabels={};tick();
+      }
+      function afterPlayerMove(){
+        if(g.remainingDice.length>0){
+          g.allLegalMoves=generateMoves(g.state,g.remainingDice,0);
+          if(g.training){
+          /* Show fast local result immediately, then update with server result if available */
+          g.analysis=analyzeMoves(g.state,g.remainingDice,0);
+          if(g.useServerAnalysis&&ANALYSIS_SERVER_URL){
+            const snapState=g.state;const snapDice=g.remainingDice.slice();
+            analyzeMovesServer(snapState,snapDice,0).then(serverResult=>{
+              /* Only update if state hasn't changed */
+              if(serverResult&&g.state===snapState&&g.training)g.analysis=serverResult;
+              tick();
+            }).catch(()=>{});
+          }
+        }
+          const hasMore=g.allLegalMoves.some(m=>m.moves.length>0);
+          if(!hasMore){
+            g.message='No more legal moves.';
+            g.analysis=null;
+            addHistory(0,g.dice,g.turnMoves);
+            tick();
+            safeTimeout(()=>endTurn(),800);
+            return;
+          }
+          g.allLegalMoves=g.allLegalMoves.filter(m=>m.moves.length>0);
+          g.message='Continue moving.';tick();
+        }else{
+          addHistory(0,g.dice,g.turnMoves);
+          endTurn();
+        }
+      }
+      function undoLastMove(){
+        if(g.turnMoves.length===0||g.phase!==P.MOVING)return;
+        const lastMove=g.turnMoves.pop();
+        g.remainingDice.push(lastMove.die);
+        g.state=g.turnStates.pop();
+        g.selected=null;g.validDests=[];g.destLabels={};
+        g.allLegalMoves=generateMoves(g.state,g.remainingDice,0);
+        if(g.training){
+          /* Show fast local result immediately, then update with server result if available */
+          g.analysis=analyzeMoves(g.state,g.remainingDice,0);
+          if(g.useServerAnalysis&&ANALYSIS_SERVER_URL){
+            const snapState=g.state;const snapDice=g.remainingDice.slice();
+            analyzeMovesServer(snapState,snapDice,0).then(serverResult=>{
+              /* Only update if state hasn't changed */
+              if(serverResult&&g.state===snapState&&g.training)g.analysis=serverResult;
+              tick();
+            }).catch(()=>{});
+          }
+        }
+        g.message='Move undone.';tick();
+      }
+
+      function endTurn(){
+        if(g.state.off[g.currentPlayer]>=15){handleWin(g.currentPlayer);return}
+        g.currentPlayer=1-g.currentPlayer;
+        g.selected=null;g.validDests=[];g.destLabels={};g.turnMoves=[];g.analysis=null;
+        if(g.currentPlayer===1){
+          if(g.gameMode==='match'&&shouldDouble(g.state,1,g.matchScore,g.matchLength,g.cubeValue,g.cubeOwner,g.crawford)){
+              g.phase=P.DOUBLING;g.message='CPU offers to double!';sfxDouble();tick();
+              return;
+          }
+          g.phase=P.CPU_ROLLING;g.message='CPU rolling...';g.diceAnim=true;tick();
+          safeTimeout(()=>{
+            g.dice=rollDice();g.diceAnim=false;g.remainingDice=getDiceList(g.dice);
+            sfxRoll();g.message='CPU thinking...';tick();
+            safeTimeout(()=>doCpuTurn(),600);
+          },600);
+        }else{
+          g.phase=P.ROLLING;g.message='Your turn — click Roll.';tick();
+        }
+      }
+      function handlePlayerRoll(){
+        if(g.phase!==P.ROLLING||g.currentPlayer!==0)return;
+        g.diceAnim=true;tick();
+        safeTimeout(()=>{
+          g.dice=rollDice();g.diceAnim=false;g.remainingDice=getDiceList(g.dice);
+          sfxRoll();beginPlayerTurn();
+        },500);
+      }
+      /* Fast-forward: instantly resolve a race position by simulating roll+best-move for both players */
+      function handleFastForward(){
+        if(hasContactMT(g.state))return; /* still contact, can't FF */
+        if(g.state.bar[0]>0||g.state.bar[1]>0)return;
+        g.fastForward=true;
+        g.message='Fast forwarding race...';
+        tick();
+        function ffStep(){
+          /* Check for win */
+          if(g.state.off[0]>=15){g.fastForward=false;handleWin(0);tick();return}
+          if(g.state.off[1]>=15){g.fastForward=false;handleWin(1);tick();return}
+          /* Roll for current player */
+          const dice=rollDice();
+          g.dice=dice;
+          g.remainingDice=getDiceList(dice);
+          /* Generate best move for race (use evaluateRaceMT for speed) */
+          const moves=generateMoves(g.state,g.remainingDice,g.currentPlayer);
+          if(moves.length===0){
+            /* No moves - skip turn */
+            g.currentPlayer=1-g.currentPlayer;
+            tick();setTimeout(ffStep,30);return;
+          }
+          /* Pick best move by evaluation */
+          let best=moves[0];let bestScore=-Infinity;
+          for(const m of moves){
+            const sc=evaluateRaceMT(m.state,g.currentPlayer);
+            if(sc>bestScore){bestScore=sc;best=m}
+          }
+          g.state=best.state;
+          g.lastMovedTo=null;g.lastMoveFrom=null;
+          /* Quick visual update */
+          tick();
+          /* Check for win after move */
+          if(g.state.off[0]>=15||g.state.off[1]>=15){
+            setTimeout(ffStep,30);return;
+          }
+          /* Switch turn */
+          g.currentPlayer=1-g.currentPlayer;
+          setTimeout(ffStep,30);
+        }
+        ffStep();
+      }
+      function handlePlayerDouble(){
+        if(g.gameMode!=='match'||g.crawford)return;
+        g.phase=P.DOUBLING;g.message='You offer to double!';sfxDouble();tick();
+        safeTimeout(()=>{
+          const accept=shouldTake(g.state,1,g.cubeValue*2);
+          if(accept){
+            g.cubeValue*=2;g.cubeOwner=1;
+            g.message='CPU accepts the double. Cube at '+g.cubeValue+'.';
+            g.phase=P.ROLLING;tick();
+          }else{
+            g.message='CPU declines — you win this game!';
+            scoreGame(0,false);
+          }
+        },1000);
+      }
+      function handleDoubleResponse(accept){
+        if(accept){
+          g.cubeValue*=2;g.cubeOwner=0;
+          g.message='You accept. Cube at '+g.cubeValue+'.';tick();
+          safeTimeout(()=>{
+            g.phase=P.CPU_ROLLING;g.message='CPU rolling...';g.diceAnim=true;tick();
+            safeTimeout(()=>{
+              g.dice=rollDice();g.diceAnim=false;g.remainingDice=getDiceList(g.dice);
+              sfxRoll();g.message='CPU thinking...';tick();
+              safeTimeout(()=>doCpuTurn(),600);
+            },600);
+          },600);
+        }else{
+          g.message='You decline — CPU wins this game.';
+          scoreGame(1,false);
+        }
+      }
+
+      function doCpuTurn(){
+        g.phase=P.CPU_TURN;
+        const worker=workerRef.current;
+        if(!worker){endTurn();return}
+
+        // Animate a sequence of CPU moves (shared by server and worker paths)
+        function playMoves(moves,finalState){
+          if(!moves||moves.length===0){
+            g.message='CPU has no legal moves.';tick();
+            safeTimeout(()=>endTurn(),800);
+            return;
+          }
+          let i=0;
+          function nextCpuMove(){
+            if(i>=moves.length){
+              g.state=finalState;
+              addHistory(1,g.dice,moves);
+              g.animating=false;
+              tick();
+              safeTimeout(()=>endTurn(),300);
+              return;
+            }
+            const mv=moves[i];
+            g.lastMovedTo=mv.to;g.lastMoveFrom=mv.from;g.lastMovePlayer=1;g.moveId++;
+            const wasHit=(mv.to>=0&&mv.to<24&&(g.state.board[mv.to]===1));
+            g.state=applyMove(g.state,mv.from,mv.to,1);
+            if(wasHit){sfxHit();hapticHeavy()}else if(mv.to===25||mv.to===-2){sfxBearOff();hapticMedium()}else{sfxPlace();hapticLight()}
+            i++;tick();
+            safeTimeout(nextCpuMove,400);
+          }
+          nextCpuMove();
+        }
+
+        function runLocalWorker(){
+          worker.onmessage=(e)=>{
+            const{moves,state:finalState}=e.data;
+            playMoves(moves,finalState);
+          };
+          worker.postMessage({state:g.state,dice:g.remainingDice,player:1,difficulty:g.difficulty});
+        }
+
+        // Master difficulty uses the gnubg server for expert-level play.
+        // Falls back to the local worker if the server is unreachable or returns nothing.
+        if(g.difficulty==='master'&&ANALYSIS_SERVER_URL){
+          g.message='CPU thinking…';tick();
+          analyzeMovesServer(g.state,g.remainingDice,1).then(result=>{
+            if(result&&result.best&&result.best.moves){
+              g.message='';
+              playMoves(result.best.moves,result.best.state);
+            }else{
+              runLocalWorker();
+            }
+          }).catch(()=>runLocalWorker());
+          return;
+        }
+
+        runLocalWorker();
+      }
+
+      function handleWin(player){
+        const opp=1-player;
+        let mult=1;let winType='single';
+        if(g.state.off[opp]===0){
+          mult=2;winType='gammon';
+          if(player===0&&(g.state.bar[1]>0||(()=>{for(let i=0;i<6;i++)if(g.state.board[i]<0)return true;return false})())){
+            mult=3;winType='backgammon';
+          }
+          if(player===1&&(g.state.bar[0]>0||(()=>{for(let i=18;i<24;i++)if(g.state.board[i]>0)return true;return false})())){
+            mult=3;winType='backgammon';
+          }
+        }
+        const points=mult*g.cubeValue;
+        if(player===0){sfxWin();hapticHeavy();maybeRequestReview();}else{sfxLose();hapticMedium()}
+        if(g.gameMode==='match'){
+          g.matchScore[player]+=points;
+          if(!g.crawfordUsed){
+            if(g.matchScore[0]>=g.matchLength-1||g.matchScore[1]>=g.matchLength-1){
+              g.crawford=true;g.crawfordUsed=true;
+            }
+          }else{g.crawford=false}
+          if(g.matchScore[player]>=g.matchLength){
+            g.phase=P.GAME_OVER;
+            g.message=player===0?`You win the match ${g.matchScore[0]}-${g.matchScore[1]}!`:`CPU wins the match ${g.matchScore[1]}-${g.matchScore[0]}.`;
+            showInterstitialAd();
+            tick();return;
+          }
+          g.phase=P.BETWEEN_GAMES;
+          g.message=`${player===0?'You':'CPU'} win${player===0?'':'s'} a ${winType}! +${points} point${points>1?'s':''}. Score: ${g.matchScore[0]}-${g.matchScore[1]}`;
+          tick();
+        }else{
+          g.phase=P.GAME_OVER;
+          g.message=player===0?`You win with a ${winType}!`:`CPU wins with a ${winType}.`;
+          showInterstitialAd();
+          tick();
+        }
+      }
+      function scoreGame(winner,_){
+        const points=g.cubeValue;
+        if(g.gameMode==='match'){
+          g.matchScore[winner]+=points;
+          if(!g.crawfordUsed&&(g.matchScore[0]>=g.matchLength-1||g.matchScore[1]>=g.matchLength-1)){
+            g.crawford=true;g.crawfordUsed=true;
+          }else{g.crawford=false}
+          if(g.matchScore[winner]>=g.matchLength){
+            g.phase=P.GAME_OVER;
+            g.message=winner===0?`You win the match ${g.matchScore[0]}-${g.matchScore[1]}!`:`CPU wins the match ${g.matchScore[1]}-${g.matchScore[0]}.`;
+            showInterstitialAd();
+            tick();return;
+          }
+          g.phase=P.BETWEEN_GAMES;
+          g.message=`${winner===0?'You':'CPU'} win${winner===0?'':'s'}! Score: ${g.matchScore[0]}-${g.matchScore[1]}`;
+        }else{
+          g.phase=P.GAME_OVER;
+          g.message=winner===0?'You win!':'CPU wins.';
+          showInterstitialAd();
+        }
+        tick();
+      }
+      function addHistory(){/* removed */}
+
+      /* ─── Scaling ─── */
+      // Scale is just for UI chrome (fonts, buttons). Board sizing is independent.
+      const scale=typeof window!=='undefined'?Math.max(0.85,Math.min(1,window.innerWidth/420)):1;
+      const isLand=typeof window!=='undefined'&&window.innerWidth>window.innerHeight;
+      const sk=getSkinColors(g.skin);
+
+      /* ─── Update body background to match theme (for safe-area / status bar regions) ─── */
+      useEffect(()=>{
+        try{
+          document.body.style.background=sk.uiBg1;
+          document.documentElement.style.background=sk.uiBg1;
+          /* Update theme-color meta for iOS status bar */
+          let meta=document.querySelector('meta[name="theme-color"]');
+          if(!meta){meta=document.createElement('meta');meta.name='theme-color';document.head.appendChild(meta)}
+          meta.content=sk.uiBg1;
+        }catch(e){}
+      },[g.skin]);
+
+      /* ─── Styles (skin-aware) ─── */
+      const S={
+        bg:{height:'100vh',background:`linear-gradient(145deg,${sk.uiBg1} 0%,${sk.uiBg2} 50%,${sk.uiBg1} 100%)`,fontFamily:"'Georgia','Times New Roman',serif",color:sk.uiText,display:'flex',flexDirection:'column',alignItems:'center',userSelect:'none',overflow:'hidden'},
+        title:{fontSize:'32px',fontWeight:'bold',textShadow:sk.uiTitleShadow,letterSpacing:'3px',color:sk.uiAccent,marginBottom:'2px'},
+        subtitle:{fontSize:'12px',color:sk.uiTextDim,letterSpacing:'2px',marginBottom:'8px'},
+        btn:(active)=>({
+          padding:'8px 16px',border:'none',borderRadius:'8px',cursor:'pointer',
+          fontFamily:"'Georgia',serif",fontSize:'14px',fontWeight:'bold',letterSpacing:'1px',
+          background:active?sk.uiBtnActive:sk.uiBtnPassive,
+          color:active?sk.uiBtnActiveText:sk.uiText,
+          boxShadow:active?'0 2px 8px rgba(0,0,0,0.3)':'none',
+          transition:'all 0.15s',
+        }),
+        panel:{background:sk.uiPanel,border:'1px solid '+sk.uiPanelBorder,borderRadius:'12px',padding:'14px',marginBottom:'8px'},
+      };
+
+      /* ─── Die Component ─── */
+      function Die({value,rolling}){
+        if(!value&&!rolling)return null;
+        const[animFace,setAnimFace]=useState(1);
+        useEffect(()=>{
+          if(!rolling)return;
+          const id=setInterval(()=>setAnimFace(Math.floor(Math.random()*6)+1),80);
+          return()=>clearInterval(id);
+        },[rolling]);
+        const face=rolling?animFace:value;
+        const dotLayouts={
+          1:[[50,50]],2:[[25,25],[75,75]],3:[[25,25],[50,50],[75,75]],
+          4:[[25,25],[75,25],[25,75],[75,75]],5:[[25,25],[75,25],[50,50],[25,75],[75,75]],
+          6:[[25,22],[75,22],[25,50],[75,50],[25,78],[75,78]],
+        };
+        const dots=dotLayouts[face]||[];
+        const sz=Math.min(44,44*scale);
+        const dotSz=Math.round(sz*0.17);
+        return React.createElement('div',{style:{
+          width:sz+'px',height:sz+'px',
+          background:'linear-gradient(145deg,#faf6ee,#e8e0d0,#d8d0c0)',
+          borderRadius:Math.round(sz*0.15)+'px',
+          border:'1px solid #b8a880',position:'relative',
+          boxShadow:'0 3px 8px rgba(0,0,0,0.5),inset 0 1px 0 rgba(255,255,255,0.6)',
+          transform:rolling?'rotate('+(Math.random()*10-5)+'deg)':'none',
+          transition:rolling?'none':'transform 0.2s',
+        }},dots.map((p,i)=>React.createElement('div',{key:i,style:{
+          position:'absolute',
+          width:dotSz+'px',height:dotSz+'px',borderRadius:'50%',
+          background:'radial-gradient(circle at 40% 35%,#4a3828,#1a0e04)',
+          left:'calc('+p[0]+'% - '+dotSz/2+'px)',
+          top:'calc('+p[1]+'% - '+dotSz/2+'px)',
+        }})));
+      }
+
+      function DoublingCube(){
+        if(g.gameMode!=='match')return null;
+        return React.createElement('div',{style:{
+          width:28*scale+'px',height:28*scale+'px',background:'linear-gradient(135deg,#f0f0f0,#d0d0d0)',
+          borderRadius:'4px',border:'1px solid #aaa',display:'flex',alignItems:'center',justifyContent:'center',
+          fontSize:12*scale+'px',fontWeight:'bold',color:'#333',
+          boxShadow:'0 1px 4px rgba(0,0,0,0.3)',
+        }},g.cubeValue);
+      }
+
+      /* ─── Render ─── */
+      // ATT Pre-prompt overlay
+      if(showPrePrompt){
+        return React.createElement('div',{style:{...S.bg,justifyContent:'center',alignItems:'center'}},
+          React.createElement('div',{style:{...S.panel,maxWidth:'340px',textAlign:'center'}},
+            React.createElement('div',{style:{fontSize:'18px',fontWeight:'bold',color:sk.uiAccent,marginBottom:'12px'}},'Personalized Ads'),
+            React.createElement('div',{style:{fontSize:'13px',color:sk.uiText,lineHeight:'1.5',marginBottom:'20px'}},
+              'We use identifiers to show you relevant ads. You can change this anytime in Settings.'),
+            React.createElement('div',{style:{display:'flex',gap:'10px',justifyContent:'center'}},
+              React.createElement('button',{onClick:()=>{setShowPrePrompt(false);if(prePromptResolveRef.current)prePromptResolveRef.current(true)},
+                style:S.btn(true)},'Allow'),
+              React.createElement('button',{onClick:()=>{setShowPrePrompt(false);if(prePromptResolveRef.current)prePromptResolveRef.current(false)},
+                style:S.btn(false)},'Continue'),
+            ),
+          ),
+        );
+      }
+
+      // MENU
+      if(g.phase===P.MENU){
+        return React.createElement('div',{style:{...S.bg,justifyContent:'center'}},
+          React.createElement('div',{style:S.title},'BACKGAMMON'),
+          React.createElement('div',{style:S.subtitle},'CLASSIC STRATEGY'),
+          React.createElement('div',{style:{...S.panel,width:Math.min(380,window.innerWidth-32)+'px',textAlign:'center'}},
+              // Difficulty
+              React.createElement('div',{style:{marginBottom:'14px'}},
+                React.createElement('div',{style:{fontSize:'11px',color:sk.uiTextDim,letterSpacing:'2px',marginBottom:'8px'}},'DIFFICULTY'),
+                React.createElement('div',{style:{display:'flex',gap:'6px',justifyContent:'center'}},
+                  ['rookie','sharp','master'].map(d=>
+                    React.createElement('button',{key:d,onClick:()=>{g.difficulty=d;tick()},style:{
+                      ...S.btn(g.difficulty===d),
+                      color:g.difficulty===d?sk.uiBtnActiveText:d==='rookie'?'#e67e22':d==='sharp'?'#3498db':'#9b59b6',
+                    }},{rookie:'Rookie',sharp:'Sharp',master:'Master'}[d])
+                  )
+                ),
+              ),
+              // Game Mode
+              React.createElement('div',{style:{marginBottom:'14px'}},
+                React.createElement('div',{style:{fontSize:'10px',color:sk.uiTextDim,letterSpacing:'2px',marginBottom:'8px'}},'GAME MODE'),
+                React.createElement('div',{style:{display:'flex',gap:'6px',justifyContent:'center'}},
+                  ['single','match'].map(m=>
+                    React.createElement('button',{key:m,onClick:()=>{g.gameMode=m;tick()},style:S.btn(g.gameMode===m)},
+                      m==='single'?'Single Game':'Match Play')
+                  )
+                ),
+              ),
+              // Match Length
+              g.gameMode==='match'?React.createElement('div',{style:{marginBottom:'14px'}},
+                React.createElement('div',{style:{fontSize:'10px',color:sk.uiTextDim,letterSpacing:'2px',marginBottom:'8px'}},'MATCH LENGTH'),
+                React.createElement('div',{style:{display:'flex',gap:'6px',justifyContent:'center'}},
+                  [1,3,5,7,11].map(n=>
+                    React.createElement('button',{key:n,onClick:()=>{g.matchLength=n;tick()},style:{
+                      ...S.btn(g.matchLength===n),fontSize:'13px',padding:'6px 12px',
+                    }},n+' pt'+(n>1?'s':''))
+                  )
+                ),
+              ):null,
+              // Training
+              React.createElement('div',{style:{marginBottom:'14px'}},
+                React.createElement('button',{onClick:()=>{g.training=!g.training;tick()},style:{
+                  ...S.btn(g.training),
+                  background:g.training?'linear-gradient(135deg,#2a6a3a,#3a8a4a)':sk.uiBtnPassive,
+                  color:g.training?'#e8d5a3':sk.uiTextDim,
+                }},'Training Mode'),
+              ),
+              // Skin selector
+              React.createElement('div',{style:{marginBottom:'14px'}},
+                React.createElement('div',{style:{fontSize:'10px',color:sk.uiTextDim,letterSpacing:'2px',marginBottom:'8px'}},'BOARD THEME'),
+                React.createElement('div',{style:{display:'flex',gap:'10px',justifyContent:'center'}},
+                  SKIN_KEYS.map(k=>{
+                    const s=SKINS[k];const active=g.skin===k;
+                    return React.createElement('div',{key:k,onClick:()=>{g.skin=k;localStorage.setItem('bgSkin',k);tick()},
+                      style:{
+                        width:'40px',height:'40px',borderRadius:'50%',cursor:'pointer',
+                        background:s.swatch,
+                        border:active?'3px solid '+sk.uiAccent:'2px solid rgba(255,255,255,0.15)',
+                        boxShadow:active?'0 0 10px '+sk.uiAccent+'66':'none',
+                        transition:'all 0.15s',
+                      },
+                      title:s.name,
+                    });
+                  })
+                ),
+                React.createElement('div',{style:{fontSize:'9px',color:sk.uiTextDim,marginTop:'6px'}},SKINS[g.skin].name),
+              ),
+              // Remove Ads / Restore
+              !adsRemoved&&iapProduct?React.createElement('div',{style:{marginBottom:'8px'}},
+                React.createElement('button',{onClick:handleRemoveAds,disabled:purchaseLoading,style:{
+                  ...S.btn(false),fontSize:'10px',opacity:purchaseLoading?0.5:1,
+                }},purchaseLoading?'Processing...':'Remove Ads ('+iapProduct.priceString+')'),
+              ):null,
+              !adsRemoved?React.createElement('div',{style:{marginBottom:'8px'}},
+                React.createElement('button',{onClick:handleRestorePurchases,disabled:purchaseLoading,style:{
+                  ...S.btn(false),fontSize:'9px',opacity:purchaseLoading?0.5:1,color:sk.uiTextDim,
+                }},purchaseLoading?'...':'Restore Purchases'),
+              ):null,
+              adsRemoved?React.createElement('div',{style:{fontSize:'11px',color:'#3a8a4a',marginBottom:'8px'}},'Ads Removed'):null,
+              // Rate app + More games row
+              React.createElement('div',{style:{display:'flex',gap:'10px',justifyContent:'center',marginBottom:'10px',flexWrap:'wrap'}},
+                React.createElement('button',{onClick:handleRateApp,style:{
+                  ...S.btn(false),fontSize:'10px',padding:'5px 10px',color:sk.uiAccent,
+                }},'Rate App'),
+                React.createElement('button',{onClick:handleMoreGames,style:{
+                  ...S.btn(false),fontSize:'10px',padding:'5px 10px',color:sk.uiAccent,
+                }},'More Games'),
+              ),
+              // Play
+              React.createElement('button',{onClick:startGame,style:{
+                ...S.btn(true),fontSize:'18px',padding:'12px 50px',marginTop:'6px',
+              }},'PLAY'),
+          ),
+        );
+      }
+
+      // GAME SCREEN
+      const uiState={selected:g.selected,validDests:g.validDests,lastMovedTo:g.lastMovedTo,destLabels:g.destLabels,lastMoveFrom:g.lastMoveFrom,lastMovePlayer:g.lastMovePlayer,moveId:g.moveId,remainingDice:g.remainingDice,phase:g.phase,currentPlayer:g.currentPlayer};
+
+      // Training panel — compact, fits within container
+      const trainingPanel=g.training&&g.analysis&&g.analysis.best?React.createElement('div',{style:{
+        ...S.panel,width:'100%',maxWidth:'500px',marginTop:'2px',padding:'8px 10px',
+      }},
+        // Header + confidence + win rate
+        React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'4px',gap:'4px',flexWrap:'wrap'}},
+          React.createElement('div',{style:{fontSize:'9px',color:sk.uiAccent,letterSpacing:'2px'}},
+            'STRATEGY',
+            g.analysis.usedServer?React.createElement('span',{style:{marginLeft:'6px',fontSize:'8px',color:'#3498db',fontWeight:'bold'}},'GNUBG'):
+              g.analysis.usedRollouts?React.createElement('span',{style:{marginLeft:'6px',fontSize:'8px',color:sk.uiTextDim}},'('+g.analysis.totalRollouts+' rollouts)'):null,
+          ),
+          React.createElement('div',{style:{display:'flex',gap:'4px',alignItems:'center'}},
+            g.analysis.usedServer&&g.analysis.best.winRate!=null?React.createElement('div',{style:{
+              fontSize:'10px',fontWeight:'bold',color:'#3498db',
+              background:'rgba(52,152,219,0.15)',padding:'1px 6px',borderRadius:'8px',
+            }},Math.round(g.analysis.best.winRate*100)+'% win'):
+              g.analysis.usedRollouts&&g.analysis.best.winRate!=null?React.createElement('div',{style:{
+                fontSize:'10px',fontWeight:'bold',color:'#2ecc71',
+                background:'rgba(46,204,113,0.15)',padding:'1px 6px',borderRadius:'8px',
+              }},Math.round(g.analysis.best.winRate*100)+'% win'):null,
+            g.analysis.confidence?React.createElement('div',{style:{
+              fontSize:'8px',fontWeight:'bold',color:g.analysis.confidence.color,
+              background:'rgba(0,0,0,0.3)',padding:'1px 6px',borderRadius:'8px',
+            }},g.analysis.confidence.label):null,
+          ),
+        ),
+        // Strategy explanation — first line only to save space
+        React.createElement('div',{style:{fontSize:'11px',color:sk.uiText,marginBottom:'4px',lineHeight:'1.3'}},
+          getStrategyExplanation(g.analysis,g.state,0)[0]||''
+        ),
+        // Tags + best move on one line
+        React.createElement('div',{style:{display:'flex',flexWrap:'wrap',gap:'3px',alignItems:'center'}},
+          g.analysis.best.tags.map((t,i)=>React.createElement('span',{key:i,style:{
+            fontSize:'8px',fontWeight:'bold',color:t.color,background:t.bg,
+            padding:'1px 5px',borderRadius:'3px',letterSpacing:'1px',
+          }},t.label)),
+          (function(){
+            const moves=g.analysis.best.moves;
+            if(!moves||moves.length===0)return null;
+            const fmt=m=>{
+              const from=m.from===-1?'BAR':(m.from+1);
+              const to=m.to===-2?'OFF':(m.to+1);
+              return from+'\u2192'+to;
+            };
+            const firstMove=fmt(moves[0]);
+            const restMoves=moves.slice(1).map(fmt).join(', ');
+            return React.createElement('span',{style:{fontSize:'9px',color:sk.uiTextDim,marginLeft:'4px'}},
+              React.createElement('span',{style:{color:sk.uiAccent,fontWeight:'bold'}},'Now: '+firstMove),
+              moves.length>1?React.createElement('span',{style:{opacity:0.6}},'  then: '+restMoves):null,
+            );
+          })(),
+        ),
+      ):null;
+
+      // ─── Controls block (reused in both layouts) ───
+      const diceBlock=React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'center',gap:'8px',padding:isLand?'6px 0':'4px 0',flexShrink:0}},
+        g.dice.length>0||g.diceAnim?React.createElement('div',{style:{display:'flex',gap:'5px'}},
+          React.createElement(Die,{value:g.dice[0],rolling:g.diceAnim}),
+          React.createElement(Die,{value:g.dice[1],rolling:g.diceAnim}),
+        ):null,
+        g.remainingDice.length>0&&g.phase===P.MOVING?React.createElement('div',{style:{fontSize:'13px',color:sk.uiTextDim}},
+          'Remaining: ',g.remainingDice.join(', ')
+        ):null,
+      );
+      /* Show fast-forward when in pure race (no contact, no bar) */
+      const canFastForward=(g.phase===P.ROLLING||g.phase===P.MOVING||g.phase===P.CPU_TURN||g.phase===P.CPU_ROLLING)&&
+        !hasContactMT(g.state)&&g.state.bar[0]===0&&g.state.bar[1]===0&&!g.fastForward;
+      const buttonsBlock=React.createElement('div',{style:{display:'flex',gap:'8px',padding:'2px 0',flexWrap:'wrap',justifyContent:'center',flexShrink:0}},
+        g.phase===P.ROLLING&&g.currentPlayer===0&&!g.diceAnim?
+          React.createElement('button',{onClick:handlePlayerRoll,style:S.btn(true)},'ROLL'):null,
+        g.phase===P.ROLLING&&g.currentPlayer===0&&!g.diceAnim&&g.gameMode==='match'&&!g.crawford&&(g.cubeOwner===-1||g.cubeOwner===0)?
+          React.createElement('button',{onClick:handlePlayerDouble,style:{
+            ...S.btn(false),
+            color:sk.uiAccentBright,
+            border:'1.5px solid '+sk.uiAccentBright,
+            fontWeight:'bold',
+          }},'DOUBLE'):null,
+        canFastForward?
+          React.createElement('button',{onClick:handleFastForward,style:{...S.btn(false),color:sk.uiAccent,fontSize:'12px'}},'⏩ FAST FWD'):null,
+        g.phase===P.MOVING&&g.turnMoves.length>0?
+          React.createElement('button',{onClick:undoLastMove,style:{...S.btn(false),fontSize:'12px'}},'UNDO'):null,
+        g.phase===P.MOVING&&g.remainingDice.length===0?
+          React.createElement('button',{onClick:()=>endTurn(),style:S.btn(true)},'CONFIRM'):null,
+        /* ACCEPT/DECLINE buttons appear when CPU offers a double (currentPlayer is CPU=1 because their turn was just starting when they offered) */
+        g.phase===P.DOUBLING&&g.currentPlayer===1?React.createElement(React.Fragment,null,
+          React.createElement('button',{onClick:()=>handleDoubleResponse(true),style:S.btn(true)},'ACCEPT'),
+          React.createElement('button',{onClick:()=>handleDoubleResponse(false),style:{...S.btn(false),color:'#c0392b'}},'DECLINE'),
+        ):null,
+        g.phase===P.BETWEEN_GAMES?
+          React.createElement('button',{onClick:()=>{startNewGame();tick()},style:S.btn(true)},'NEXT GAME'):null,
+        g.phase===P.GAME_OVER?React.createElement(React.Fragment,null,
+          React.createElement('button',{onClick:startGame,style:S.btn(true)},'NEW MATCH'),
+          React.createElement('button',{onClick:()=>{g.phase=P.MENU;g.analysis=null;tick()},style:S.btn(false)},'MENU'),
+        ):null,
+      );
+      const msgBlock=React.createElement('div',{style:{
+        padding:'2px 0',fontSize:'14px',color:g.phase===P.GAME_OVER?sk.uiAccent:sk.uiText,
+        textAlign:'center',flexShrink:0,
+        animation:g.phase===P.GAME_OVER?'celebratePulse 2s infinite':'none',
+      }},g.message);
+      const scoreBlock=React.createElement('div',{style:{
+        display:'flex',gap:'10px',alignItems:'center',padding:'0 10px 2px',fontSize:'13px',flexWrap:'wrap',justifyContent:'center',flexShrink:0,
+      }},
+        g.gameMode==='match'?React.createElement(React.Fragment,null,
+          React.createElement('span',{style:{color:sk.uiAccent}},'You: ',React.createElement('b',null,g.matchScore[0])),
+          React.createElement('span',{style:{color:sk.uiTextDim}},'/',g.matchLength),
+          React.createElement('span',{style:{color:sk.uiTextDim}},'CPU: ',React.createElement('b',null,g.matchScore[1])),
+          React.createElement(DoublingCube),
+          g.crawford?React.createElement('span',{style:{fontSize:'10px',color:'#e67e22'}},'CRAWFORD'):'',
+        ):null,
+        g.training?React.createElement('span',{style:{fontSize:'11px',color:sk.uiTextDim}},'You: '+pipCount(g.state,0)+'pip'):null,
+        g.training?React.createElement('span',{style:{fontSize:'11px',color:sk.uiTextDim}},'CPU: '+pipCount(g.state,1)+'pip'):null,
+      );
+      // key forces full remount when viewport changes (orientation)
+      const boardKey='board-'+window.innerWidth+'-'+window.innerHeight;
+      const boardEl=React.createElement(BoardCanvas,{
+        key:boardKey,
+        gameState:g.state,uiState,
+        onPointClick:handlePointClick,onBarClick:handleBarClick,onBearOffClick:handleBearOffClick,
+        scale,training:g.training,analysis:g.analysis,skin:g.skin,
+      });
+
+      // ─── LANDSCAPE LAYOUT: header top, board left, controls right ───
+      if(isLand){
+        return React.createElement('div',{style:{...S.bg,overflow:'hidden',position:'relative'}},
+          // Header row
+          React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',width:'100%',padding:'4px 10px 2px',flexShrink:0}},
+            React.createElement('div',{style:{fontSize:'15px',fontWeight:'bold',color:sk.uiAccent}},
+              'BACKGAMMON',
+              g.training?React.createElement('span',{style:{fontSize:'9px',color:'#3a8a4a',marginLeft:'8px'}},'TRAINING'):'',
+            ),
+            scoreBlock,
+            React.createElement('button',{onClick:()=>{g.phase=P.MENU;g.analysis=null;tick()},style:{
+              ...S.btn(false),fontSize:'10px',padding:'3px 8px',
+            }},'MENU'),
+          ),
+          // Main area: board left, controls right
+          React.createElement('div',{style:{flex:1,display:'flex',alignItems:'center',justifyContent:'center',gap:'10px',minHeight:0,overflow:'hidden',padding:'0 6px'}},
+            boardEl,
+            // Right side controls — flex column, scrollable if training is on
+            React.createElement('div',{style:{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:'4px',width:'220px',flexShrink:0,maxHeight:'100%',overflowY:'auto',padding:'0 4px'}},
+              diceBlock,
+              buttonsBlock,
+              msgBlock,
+              trainingPanel,
+            ),
+          ),
+        );
+      }
+
+      // ─── PORTRAIT LAYOUT: everything stacked vertically ───
+      return React.createElement('div',{style:{...S.bg,overflow:'hidden',position:'relative'}},
+        // Header — pinned to top
+        React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',width:'100%',padding:'6px 10px 4px',flexShrink:0}},
+          React.createElement('div',{style:{fontSize:'15px',fontWeight:'bold',color:sk.uiAccent}},
+            'BACKGAMMON',
+            g.training?React.createElement('span',{style:{fontSize:'9px',color:'#3a8a4a',marginLeft:'8px'}},'TRAINING'):'',
+          ),
+          React.createElement('button',{onClick:()=>{g.phase=P.MENU;g.analysis=null;tick()},style:{
+            ...S.btn(false),fontSize:'10px',padding:'3px 8px',
+          }},'MENU'),
+        ),
+        scoreBlock,
+        // Board
+        boardEl,
+        // Controls below board
+        diceBlock,
+        buttonsBlock,
+        msgBlock,
+        // Training panel — compact, no extra wrapper needed
+        trainingPanel?React.createElement('div',{style:{flexShrink:0,width:'100%',padding:'0 8px'}},trainingPanel):null,
+        // Spacer pushes ad to bottom
+        React.createElement('div',{style:{flex:1}}),
+        // Ad banner spacer
+        !adsRemoved?React.createElement('div',{style:{height:'60px',flexShrink:0}}):null,
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+  </script>
+</body>
+</html>
