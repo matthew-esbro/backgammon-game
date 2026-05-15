@@ -975,7 +975,11 @@
     function shouldDouble(state,player,matchScore,matchLength,cubeValue,cubeOwner,crawford){
       if(crawford)return false;
       if(cubeOwner!==-1&&cubeOwner!==player)return false;
-      if(cubeValue>=64)return false;
+      /* Match-aware cap: a single game can never be worth more than the
+         match, so doubling past matchLength is pointless (this is why the
+         cube could absurdly run to 64 in a 5-point match). 64 kept as an
+         absolute backstop for any non-match mode. */
+      if(cubeValue>=64||cubeValue>=matchLength)return false;
       const wp=estimateWinProb(state,player);
       const gp=estimateGammonProb(state,player);
       const effectiveWin=wp+gp*0.5;
@@ -2711,6 +2715,7 @@
       }
       function handlePlayerDouble(){
         if(g.gameMode!=='match'||g.crawford)return;
+        if(g.cubeValue>=g.matchLength)return; /* cube already covers the match */
         g.phase=P.DOUBLING;g.message='You offer to double!';sfxDouble();tick();
         safeTimeout(()=>{
           const accept=shouldTake(g.state,1,g.cubeValue*2);
@@ -3182,7 +3187,7 @@
       const buttonsBlock=React.createElement('div',{style:{display:'flex',gap:'8px',padding:'2px 0',flexWrap:'wrap',justifyContent:'center',flexShrink:0}},
         g.phase===P.ROLLING&&g.currentPlayer===0&&!g.diceAnim?
           React.createElement('button',{onClick:handlePlayerRoll,style:S.btn(true)},'ROLL'):null,
-        g.phase===P.ROLLING&&g.currentPlayer===0&&!g.diceAnim&&g.gameMode==='match'&&!g.crawford&&(g.cubeOwner===-1||g.cubeOwner===0)?
+        g.phase===P.ROLLING&&g.currentPlayer===0&&!g.diceAnim&&g.gameMode==='match'&&!g.crawford&&g.cubeValue<g.matchLength&&(g.cubeOwner===-1||g.cubeOwner===0)?
           React.createElement('button',{onClick:handlePlayerDouble,style:{
             ...S.btn(false),
             color:sk.uiAccentBright,
