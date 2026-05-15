@@ -2209,6 +2209,13 @@
 
       const showInterstitialAd = async () => {
         if (adsRemoved || !interstitialLoaded || typeof Capacitor === 'undefined') return;
+        // Global 60s cooldown across ALL interstitial triggers. AdMob bans
+        // accounts for ads on every action / back-to-back ads; this also
+        // prevents the game-over ad and a MENU-tap ad from doubling up.
+        // Stored on the persistent g ref so it survives re-renders.
+        const now = Date.now();
+        if (g.lastInterstitialAt && now - g.lastInterstitialAt < 60000) return;
+        g.lastInterstitialAt = now;  // set before await so rapid taps can't race past
         try {
           const { AdMob } = Capacitor.Plugins;
           if (!AdMob) return;
@@ -3197,7 +3204,7 @@
           React.createElement('button',{onClick:()=>{startNewGame();tick()},style:S.btn(true)},'NEXT GAME'):null,
         g.phase===P.GAME_OVER?React.createElement(React.Fragment,null,
           React.createElement('button',{onClick:startGame,style:S.btn(true)},'NEW MATCH'),
-          React.createElement('button',{onClick:()=>{g.phase=P.MENU;g.analysis=null;tick()},style:S.btn(false)},'MENU'),
+          React.createElement('button',{onClick:()=>{showInterstitialAd();g.phase=P.MENU;g.analysis=null;tick()},style:S.btn(false)},'MENU'),
         ):null,
       );
       const msgBlock=React.createElement('div',{style:{
@@ -3237,7 +3244,7 @@
               g.training?React.createElement('span',{style:{fontSize:'9px',color:'#3a8a4a',marginLeft:'8px'}},'TRAINING'):'',
             ),
             scoreBlock,
-            React.createElement('button',{onClick:()=>{g.phase=P.MENU;g.analysis=null;tick()},style:{
+            React.createElement('button',{onClick:()=>{showInterstitialAd();g.phase=P.MENU;g.analysis=null;tick()},style:{
               ...S.btn(false),fontSize:'10px',padding:'3px 8px',
             }},'MENU'),
           ),
@@ -3263,7 +3270,7 @@
             'BACKGAMMON',
             g.training?React.createElement('span',{style:{fontSize:'9px',color:'#3a8a4a',marginLeft:'8px'}},'TRAINING'):'',
           ),
-          React.createElement('button',{onClick:()=>{g.phase=P.MENU;g.analysis=null;tick()},style:{
+          React.createElement('button',{onClick:()=>{showInterstitialAd();g.phase=P.MENU;g.analysis=null;tick()},style:{
             ...S.btn(false),fontSize:'10px',padding:'3px 8px',
           }},'MENU'),
         ),
