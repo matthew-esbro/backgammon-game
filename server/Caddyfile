@@ -17,9 +17,16 @@
 		respond "" 204
 	}
 
-	# Health check endpoint
+	# Health check endpoint. Needs CORS headers too: the web client polls
+	# this cross-origin to detect reachability (gating Master/Training).
+	# Without the header the browser blocks the read and a healthy server
+	# looks offline.
 	@health path /health /
 	handle @health {
+		header {
+			Access-Control-Allow-Origin "*"
+			Access-Control-Allow-Methods "GET, OPTIONS"
+		}
 		respond "OK" 200
 	}
 

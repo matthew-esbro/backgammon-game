@@ -2081,16 +2081,34 @@
         return()=>workerRef.current&&workerRef.current.terminate();
       },[]);
 
-      /* Warm the analysis server the moment the app loads (while the player
-         is still on the menu choosing options). Fly auto-stops idle machines;
-         this kick wakes one so it's ready by the time the first move needs
-         analysis, instead of the player eating a 6-8s cold start and getting
-         the local fallback on their opening move. Fire-and-forget. */
+      /* Probe the analysis server on a loop. Doubles as the cold-start warmup
+         (the GET wakes an idle Fly machine) AND tracks reachability so the
+         menu can gate Master/Training, which are gnubg-only. /health returns
+         CORS headers so a normal fetch can read the status. Re-checks every
+         10s so it self-heals the moment the connection returns. */
       useEffect(()=>{
-        if(!ANALYSIS_SERVER_URL)return;
-        try{
-          fetch(ANALYSIS_SERVER_URL+'/health',{method:'GET',mode:'no-cors'}).catch(()=>{});
-        }catch(e){/* ignore */}
+        if(!ANALYSIS_SERVER_URL){g.serverReachable=false;tick();return;}
+        let cancelled=false;
+        function offlineCoerce(){
+          /* Don't strand the player in a server-only mode. Only adjust on the
+             menu — mid-game has its own pause/retry handling. */
+          if(g.phase===P.MENU){
+            if(g.difficulty==='master')g.difficulty='sharp';
+            if(g.training)g.training=false;
+          }
+        }
+        function check(){
+          const ctrl=new AbortController();
+          const t=setTimeout(()=>ctrl.abort(),7000);
+          fetch(ANALYSIS_SERVER_URL+'/health',{method:'GET',signal:ctrl.signal})
+            .then(r=>{clearTimeout(t);if(cancelled)return;
+              g.serverReachable=r.ok;if(!r.ok)offlineCoerce();tick();})
+            .catch(()=>{clearTimeout(t);if(cancelled)return;
+              g.serverReachable=false;offlineCoerce();tick();});
+        }
+        check();
+        const id=setInterval(check,10000);
+        return()=>{cancelled=true;clearInterval(id);};
       },[]);
 
       // Force re-render on resize/orientation change so layout recalculates
@@ -2956,13 +2974,18 @@
               React.createElement('div',{style:{marginBottom:'14px'}},
                 React.createElement('div',{style:{fontSize:'11px',color:sk.uiTextDim,letterSpacing:'2px',marginBottom:'8px'}},'DIFFICULTY'),
                 React.createElement('div',{style:{display:'flex',gap:'6px',justifyContent:'center'}},
-                  ['rookie','sharp','master'].map(d=>
-                    React.createElement('button',{key:d,onClick:()=>{g.difficulty=d;tick()},style:{
+                  ['rookie','sharp','master'].map(d=>{
+                    const locked=(d==='master')&&g.serverReachable===false;
+                    return React.createElement('button',{key:d,onClick:()=>{if(locked)return;g.difficulty=d;tick()},style:{
                       ...S.btn(g.difficulty===d),
                       color:g.difficulty===d?sk.uiBtnActiveText:d==='rookie'?'#e67e22':d==='sharp'?'#3498db':'#9b59b6',
+                      opacity:locked?0.4:1,cursor:locked?'not-allowed':'pointer',
                     }},{rookie:'Rookie',sharp:'Sharp',master:'Master'}[d])
-                  )
+                  })
                 ),
+                g.serverReachable===false?React.createElement('div',{style:{
+                  fontSize:'10px',color:'#c0392b',marginTop:'6px',
+                }},'No internet — Master & Training need a connection'):null,
               ),
               // Game Mode
               React.createElement('div',{style:{marginBottom:'14px'}},
@@ -2987,11 +3010,13 @@
               ):null,
               // Training
               React.createElement('div',{style:{marginBottom:'14px'}},
-                React.createElement('button',{onClick:()=>{g.training=!g.training;tick()},style:{
+                (function(){const tLocked=g.serverReachable===false;
+                return React.createElement('button',{onClick:()=>{if(tLocked)return;g.training=!g.training;tick()},style:{
                   ...S.btn(g.training),
                   background:g.training?'linear-gradient(135deg,#2a6a3a,#3a8a4a)':sk.uiBtnPassive,
                   color:g.training?'#e8d5a3':sk.uiTextDim,
-                }},'Training Mode'),
+                  opacity:tLocked?0.4:1,cursor:tLocked?'not-allowed':'pointer',
+                }},'Training Mode')})(),
               ),
               // Skin selector
               React.createElement('div',{style:{marginBottom:'14px'}},
