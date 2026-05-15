@@ -2322,15 +2322,23 @@
       }
       function beginPlayerTurn(){
         g.phase=P.MOVING;g.turnMoves=[];g.turnStates=[cloneState(g.state)];
+        g.turnPlan=null; /* immutable snapshot of the turn-start recommended play */
         g.allLegalMoves=generateMoves(g.state,g.remainingDice,0);
         if(g.training){
-          /* Show fast local result immediately, then update with server result if available */
+          /* Show fast local result immediately, then update with server result
+             if available. g.turnPlan stores an UNMUTATED copy of the best play
+             so afterPlayerMove can recompute "what's left" from scratch each
+             move (recomputing from a previously-reduced list double-counts). */
           g.analysis=analyzeMoves(g.state,g.remainingDice,0);
+          g.turnPlan=g.analysis&&g.analysis.best?{base:g.analysis,moves:g.analysis.best.moves.slice()}:null;
           if(g.useServerAnalysis&&ANALYSIS_SERVER_URL){
             const snapState=g.state;const snapDice=g.remainingDice.slice();
             analyzeMovesServer(snapState,snapDice,0).then(serverResult=>{
-              /* Only update if state hasn't changed */
-              if(serverResult&&g.state===snapState&&g.training)g.analysis=serverResult;
+              /* Only update if state hasn't changed (no move played yet) */
+              if(serverResult&&g.state===snapState&&g.training){
+                g.analysis=serverResult;
+                g.turnPlan=serverResult.best?{base:serverResult,moves:serverResult.best.moves.slice()}:null;
+              }
               tick();
             }).catch(()=>{});
           }
@@ -2512,22 +2520,47 @@
                from the plan — we fall back to local in that case since the
                server's /getmoves endpoint expects a fresh roll, not the
                remainder of one. */
-            const stored=g.analysis;
-            const plan=stored&&stored.best&&stored.best.moves?stored.best.moves:null;
+            /* Read the plan from the IMMUTABLE turn-start snapshot, never from
+               g.analysis (which we overwrite with the reduced list for display
+               each move — re-reading that would double-count consumption). */
+            const tp=g.turnPlan;
+            const plan=tp&&tp.base&&tp.base.best&&tp.base.best.moves?tp.base.best.moves:null;
             const played=g.turnMoves;
             let onPlan=false;
+            let remaining=null;
             if(plan&&plan.length>=played.length&&played.length>0){
+              /* Order-insensitive match. Doubles (4 identical dice) and most
+                 2-dice rolls can be played in any order and reach the same
+                 position, so the moves played so far just need to be a
+                 sub-multiset of the recommended play — a positional compare
+                 wrongly flags a re-ordered-but-identical play as a deviation
+                 and drops to the local engine mid-turn (the bug: doubles went
+                 EXPERT for 2 moves then "240 rollouts" for the rest). */
+              const key=m=>m.from+'>'+m.to;
+              const planCount={};
+              for(const m of plan){const k=key(m);planCount[k]=(planCount[k]||0)+1;}
+              const playedCount={};
               onPlan=true;
-              for(let i=0;i<played.length;i++){
-                if(plan[i].from!==played[i].from||plan[i].to!==played[i].to){
-                  onPlan=false;break;
+              for(const m of played){
+                const k=key(m);
+                playedCount[k]=(playedCount[k]||0)+1;
+                if(playedCount[k]>(planCount[k]||0)){onPlan=false;break;}
+              }
+              if(onPlan){
+                /* Remaining = plan moves not yet consumed, in plan order so
+                   the "Now: X  then: Y" display still reads sensibly. */
+                remaining=[];
+                const taken={};
+                for(const m of plan){
+                  const k=key(m);
+                  taken[k]=(taken[k]||0)+1;
+                  if(taken[k]>(playedCount[k]||0))remaining.push(m);
                 }
               }
             }
-            if(onPlan){
-              const remaining=plan.slice(played.length);
+            if(onPlan&&remaining){
               if(remaining.length>0){
-                g.analysis={...stored,best:{...stored.best,moves:remaining}};
+                g.analysis={...tp.base,best:{...tp.base.best,moves:remaining}};
               }else{
                 g.analysis=null;
               }
