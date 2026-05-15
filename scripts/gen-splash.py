@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
-"""Generate the iOS launch screen (2732x2732 + 1x/2x/3x).
+"""iOS launch screen (2732x2732 + 1x/2x/3x).
 
-Esbro Labs wordmark, stacked vertically, in the in-game "Ivory" theme:
-  bg    #f0e8d0  (Ivory uiBg1 — matches the app's menu background)
-  title #3a2818  (Ivory uiText — dark espresso)
-  sub   #7a5838  (Ivory uiTextDim)
-Rendered with Georgia (matches the in-game serif type). Centered so it
-survives Capacitor's per-device center-crop.
+Esbro Labs wordmark stacked vertically, in Instrument Serif (the brand
+font from the source SVG), styled like the in-game "BACKGAMMON" title
+in the Ivory theme:
+  bg         #f0e8d0   Ivory uiBg1 (matches the app menu background)
+  text       #7a4818   Ivory uiAccent
+  hard shadow #c8a878  offset down-right (letterpress emboss)
+  soft glow  rgba(122,72,24,~0.15) blurred
+  subtitle   #7a5838   Ivory uiTextDim (no heavy shadow, like the
+                        in-game CLASSIC STRATEGY subtitle)
+Centered so it survives Capacitor's per-device center-crop.
 """
 import os
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPLASH_DIR = os.path.join(REPO, "ios/App/App/Assets.xcassets/Splash.imageset")
+FONT_PATH = os.path.join(REPO, "scripts/InstrumentSerif-Regular.ttf")
 
 OUT = 2732
-BG = (0xf0, 0xe8, 0xd0)     # Ivory uiBg1
-TITLE = (0x3a, 0x28, 0x18)  # Ivory uiText
-SUB = (0x7a, 0x58, 0x38)    # Ivory uiTextDim
+BG = (0xf0, 0xe8, 0xd0)       # Ivory uiBg1
+TXT = (0x7a, 0x48, 0x18)      # Ivory uiAccent
+HARD = (0xc8, 0xa8, 0x78)     # in-game uiTitleShadow hard offset color
+GLOW = (122, 72, 24)          # in-game uiTitleShadow glow color
+SUB = (0x7a, 0x58, 0x38)      # Ivory uiTextDim
+
+TITLE_SIZE = 320
+SUB_SIZE = 66
 
 
-def georgia(size):
-    for p in (
-        "/System/Library/Fonts/Supplemental/Georgia.ttf",
-        "/Library/Fonts/Georgia.ttf",
-    ):
-        if os.path.exists(p):
-            return ImageFont.truetype(p, size)
-    return ImageFont.load_default()
+def imserif(size):
+    return ImageFont.truetype(FONT_PATH, size)
 
 
 def draw_tracked(draw, text, center_x, baseline_y, font, fill, tracking):
@@ -42,27 +46,40 @@ def draw_tracked(draw, text, center_x, baseline_y, font, fill, tracking):
 
 def render():
     img = Image.new("RGB", (OUT, OUT), BG)
-    draw = ImageDraw.Draw(img)
     cx = OUT / 2.0
 
-    title_size = 300
-    title_font = georgia(title_size)
-    title_track = title_size * 0.10
+    title_font = imserif(TITLE_SIZE)
+    title_track = TITLE_SIZE * 0.06  # in-game title is 3px / 32px ~ 0.09; a
+                                     # touch tighter reads better stacked
 
-    # Two stacked title lines, vertically centred slightly above middle.
-    line_gap = int(title_size * 1.18)
-    block_center_y = int(OUT * 0.46)
-    l1_baseline = block_center_y - line_gap // 2 + title_size // 3
-    l2_baseline = l1_baseline + line_gap
+    line_gap = int(TITLE_SIZE * 1.16)
+    block_center_y = int(OUT * 0.45)
+    l1 = block_center_y - line_gap // 2 + TITLE_SIZE // 3
+    l2 = l1 + line_gap
+    title_lines = [("Esbro", l1), ("Labs", l2)]
 
-    draw_tracked(draw, "Esbro", cx, l1_baseline, title_font, TITLE, title_track)
-    draw_tracked(draw, "Labs", cx, l2_baseline, title_font, TITLE, title_track)
+    # 1. Soft glow — render the title lines opaque on a layer, blur, fade.
+    glow = Image.new("RGBA", (OUT, OUT), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    for txt, by in title_lines:
+        draw_tracked(gd, txt, cx, by, title_font, GLOW + (255,), title_track)
+    glow = glow.filter(ImageFilter.GaussianBlur(int(TITLE_SIZE * 0.16)))
+    alpha = glow.split()[3].point(lambda v: int(v * 0.18))
+    glow.putalpha(alpha)
+    img.paste(glow, (0, 0), glow)
+    draw = ImageDraw.Draw(img)
 
-    # Subtitle below the stack.
-    sub_size = 64
-    sub_font = georgia(sub_size)
-    draw_tracked(draw, "EST. 2026", cx, l2_baseline + int(title_size * 0.62),
-                 sub_font, SUB, sub_size * 0.45)
+    # 2. Hard offset shadow (down-right) then 3. the wordmark on top.
+    off = max(2, int(TITLE_SIZE * 0.045))
+    for txt, by in title_lines:
+        draw_tracked(draw, txt, cx + off, by + off, title_font, HARD, title_track)
+    for txt, by in title_lines:
+        draw_tracked(draw, txt, cx, by, title_font, TXT, title_track)
+
+    # Subtitle — plain dim color, like the in-game CLASSIC STRATEGY line.
+    sub_font = imserif(SUB_SIZE)
+    draw_tracked(draw, "EST. 2026", cx, l2 + int(TITLE_SIZE * 0.60),
+                 sub_font, SUB, SUB_SIZE * 0.5)
     return img
 
 
