@@ -2463,6 +2463,13 @@
       }
       function selectChecker(pt){
         g.selected=pt;
+        // Bar rule: while ANY checker is on the bar, the only legal source
+        // is the bar. You must enter every barred checker before moving
+        // anything else (including a checker you just entered this turn).
+        if(g.state.bar[0]>0&&pt!==-1){
+          g.selected=null;g.validDests=[];g.destLabels={};
+          g.message='Enter from the bar first.';tick();return;
+        }
         const destsMap={};
         function addDest(dest,info){
           const k=dest;
@@ -2488,6 +2495,10 @@
             if(pt===-1){mid=24-die1}else{mid=pt-die1}
             if(mid>=0&&mid<24&&canLand(g.state.board,mid,0)){
               const tempState=applyMove(g.state,pt===-1?-1:pt,mid,0);
+              // Entering from the bar with die1: only allow running on with
+              // die2 if the bar is now CLEAR. With 2+ on the bar, die2 must
+              // enter the next checker, not move the one just entered.
+              if(pt===-1&&tempState.bar[0]>0)continue;
               const remainAfter=[...g.remainingDice];
               remainAfter.splice(remainAfter.indexOf(die1),1);
               for(const die2 of [...new Set(remainAfter)]){
