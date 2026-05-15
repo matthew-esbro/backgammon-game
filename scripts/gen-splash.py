@@ -56,7 +56,7 @@ def render():
     block_center_y = int(OUT * 0.45)
     l1 = block_center_y - line_gap // 2 + TITLE_SIZE // 3
     l2 = l1 + line_gap
-    title_lines = [("Esbro", l1), ("Labs", l2)]
+    title_lines = [("ESBRO", l1), ("LABS", l2)]
 
     # 1. Soft glow — render the title lines opaque on a layer, blur, fade.
     glow = Image.new("RGBA", (OUT, OUT), (0, 0, 0, 0))
