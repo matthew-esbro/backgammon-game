@@ -2383,6 +2383,23 @@
         g.phase=P.MOVING;g.turnMoves=[];g.turnStates=[cloneState(g.state)];
         g.turnPlan=null; /* immutable snapshot of the turn-start recommended play */
         g.allLegalMoves=generateMoves(g.state,g.remainingDice,0);
+
+        // Resolve "no legal moves" FIRST — before any server call. Otherwise
+        // gnubg legitimately returns no plays for a stuck position (e.g. a
+        // checker on the bar that can't enter), analyzeMovesServer returns
+        // null, and the async handler below misreads that as "server
+        // offline", overwriting the correct "turn passes" message.
+        const hasRealMoves=g.allLegalMoves.some(m=>m.moves.length>0);
+        if(!hasRealMoves){
+          g.message='No legal moves — turn passes.';
+          g.analysis=null;
+          g.phase=P.MOVING;tick();
+          safeTimeout(()=>endTurn(),1200);
+          return;
+        }
+        // Filter out empty-move results
+        g.allLegalMoves=g.allLegalMoves.filter(m=>m.moves.length>0);
+
         if(g.training){
           /* Training is gnubg-only. No local fallback: a weaker engine
              masquerading as expert advice is worse than no advice. Show
@@ -2410,17 +2427,6 @@
             g.analysis={offline:true};
           }
         }
-        // No legal moves if empty or all results have 0 actual moves
-        const hasRealMoves=g.allLegalMoves.some(m=>m.moves.length>0);
-        if(!hasRealMoves){
-          g.message='No legal moves — turn passes.';
-          g.analysis=null;
-          g.phase=P.MOVING;tick();
-          safeTimeout(()=>endTurn(),1200);
-          return;
-        }
-        // Filter out empty-move results
-        g.allLegalMoves=g.allLegalMoves.filter(m=>m.moves.length>0);
         g.selected=null;g.message='Your turn — select a checker to move.';tick();
       }
 
