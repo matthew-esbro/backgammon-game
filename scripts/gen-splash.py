@@ -26,8 +26,8 @@ HARD = (0xc8, 0xa8, 0x78)     # in-game uiTitleShadow hard offset color
 GLOW = (122, 72, 24)          # in-game uiTitleShadow glow color
 SUB = (0x7a, 0x58, 0x38)      # Ivory uiTextDim
 
-TITLE_SIZE = 320
-SUB_SIZE = 66
+TITLE_SIZE = 220
+SUB_SIZE = 52
 
 
 def imserif(size):
