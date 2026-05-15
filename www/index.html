@@ -2320,27 +2320,76 @@
           tick();
         },1000);
       }
+      /* Derive the training recommendation purely from the immutable
+         turn-start gnubg plan. NEVER falls back to the local engine — if a
+         gnubg answer can't be derived we surface an honest status instead:
+           {loading:true}  waiting on the server
+           {offline:true}  server unreachable / no connection
+           {offPlan:true}  player went off gnubg's line; can't re-analyze a
+                            partial roll (gnubg's API expects a fresh roll)
+         The training panel renders a clear message for each. */
+      function refreshTrainingPanel(){
+        if(!g.training)return;
+        const tp=g.turnPlan;
+        if(!tp||!tp.base||!tp.base.best||!tp.base.best.moves){
+          g.analysis={offline:true};return;
+        }
+        const plan=tp.base.best.moves;
+        const played=g.turnMoves;
+        const key=m=>m.from+'>'+m.to;
+        const planCount={};
+        for(const m of plan){const k=key(m);planCount[k]=(planCount[k]||0)+1;}
+        let onPlan=plan.length>=played.length;
+        const playedCount={};
+        if(onPlan){
+          for(const m of played){
+            const k=key(m);
+            playedCount[k]=(playedCount[k]||0)+1;
+            if(playedCount[k]>(planCount[k]||0)){onPlan=false;break;}
+          }
+        }
+        if(!onPlan){g.analysis={offPlan:true};return;}
+        const remaining=[];
+        const taken={};
+        for(const m of plan){
+          const k=key(m);
+          taken[k]=(taken[k]||0)+1;
+          if(taken[k]>(playedCount[k]||0))remaining.push(m);
+        }
+        g.analysis=remaining.length>0
+          ?{...tp.base,best:{...tp.base.best,moves:remaining}}
+          :null;
+      }
+
       function beginPlayerTurn(){
         g.phase=P.MOVING;g.turnMoves=[];g.turnStates=[cloneState(g.state)];
         g.turnPlan=null; /* immutable snapshot of the turn-start recommended play */
         g.allLegalMoves=generateMoves(g.state,g.remainingDice,0);
         if(g.training){
-          /* Show fast local result immediately, then update with server result
-             if available. g.turnPlan stores an UNMUTATED copy of the best play
-             so afterPlayerMove can recompute "what's left" from scratch each
-             move (recomputing from a previously-reduced list double-counts). */
-          g.analysis=analyzeMoves(g.state,g.remainingDice,0);
-          g.turnPlan=g.analysis&&g.analysis.best?{base:g.analysis,moves:g.analysis.best.moves.slice()}:null;
-          if(g.useServerAnalysis&&ANALYSIS_SERVER_URL){
+          /* Training is gnubg-only. No local fallback: a weaker engine
+             masquerading as expert advice is worse than no advice. Show
+             "Analyzing…" while the server responds, then either the EXPERT
+             result or an honest "needs internet" message. */
+          g.turnPlan=null;
+          if(ANALYSIS_SERVER_URL){
+            g.analysis={loading:true};
             const snapState=g.state;const snapDice=g.remainingDice.slice();
             analyzeMovesServer(snapState,snapDice,0).then(serverResult=>{
-              /* Only update if state hasn't changed (no move played yet) */
-              if(serverResult&&g.state===snapState&&g.training){
-                g.analysis=serverResult;
-                g.turnPlan=serverResult.best?{base:serverResult,moves:serverResult.best.moves.slice()}:null;
+              if(g.state===snapState&&g.training){
+                if(serverResult&&serverResult.best){
+                  g.analysis=serverResult;
+                  g.turnPlan={base:serverResult,moves:serverResult.best.moves.slice()};
+                }else{
+                  g.analysis={offline:true};g.turnPlan=null;
+                }
               }
               tick();
-            }).catch(()=>{});
+            }).catch(()=>{
+              if(g.state===snapState&&g.training){g.analysis={offline:true};g.turnPlan=null;}
+              tick();
+            });
+          }else{
+            g.analysis={offline:true};
           }
         }
         // No legal moves if empty or all results have 0 actual moves
@@ -2512,61 +2561,11 @@
         if(g.remainingDice.length>0){
           g.allLegalMoves=generateMoves(g.state,g.remainingDice,0);
           if(g.training){
-            /* Advance through the stored plan from turn start: if every move
-               played so far matches the leading moves of the recommended play,
-               slice them off and keep displaying the remaining moves at the
-               original analysis quality (gnubg if the server responded in
-               time, otherwise local). Only re-analyze if the player deviated
-               from the plan — we fall back to local in that case since the
-               server's /getmoves endpoint expects a fresh roll, not the
-               remainder of one. */
-            /* Read the plan from the IMMUTABLE turn-start snapshot, never from
-               g.analysis (which we overwrite with the reduced list for display
-               each move — re-reading that would double-count consumption). */
-            const tp=g.turnPlan;
-            const plan=tp&&tp.base&&tp.base.best&&tp.base.best.moves?tp.base.best.moves:null;
-            const played=g.turnMoves;
-            let onPlan=false;
-            let remaining=null;
-            if(plan&&plan.length>=played.length&&played.length>0){
-              /* Order-insensitive match. Doubles (4 identical dice) and most
-                 2-dice rolls can be played in any order and reach the same
-                 position, so the moves played so far just need to be a
-                 sub-multiset of the recommended play — a positional compare
-                 wrongly flags a re-ordered-but-identical play as a deviation
-                 and drops to the local engine mid-turn (the bug: doubles went
-                 EXPERT for 2 moves then "240 rollouts" for the rest). */
-              const key=m=>m.from+'>'+m.to;
-              const planCount={};
-              for(const m of plan){const k=key(m);planCount[k]=(planCount[k]||0)+1;}
-              const playedCount={};
-              onPlan=true;
-              for(const m of played){
-                const k=key(m);
-                playedCount[k]=(playedCount[k]||0)+1;
-                if(playedCount[k]>(planCount[k]||0)){onPlan=false;break;}
-              }
-              if(onPlan){
-                /* Remaining = plan moves not yet consumed, in plan order so
-                   the "Now: X  then: Y" display still reads sensibly. */
-                remaining=[];
-                const taken={};
-                for(const m of plan){
-                  const k=key(m);
-                  taken[k]=(taken[k]||0)+1;
-                  if(taken[k]>(playedCount[k]||0))remaining.push(m);
-                }
-              }
-            }
-            if(onPlan&&remaining){
-              if(remaining.length>0){
-                g.analysis={...tp.base,best:{...tp.base.best,moves:remaining}};
-              }else{
-                g.analysis=null;
-              }
-            }else{
-              g.analysis=analyzeMoves(g.state,g.remainingDice,0);
-            }
+            /* Re-derive from the immutable turn-start gnubg plan. Never local:
+               if on-plan, shows the remaining gnubg moves; if the player went
+               off the recommended line, shows an honest "off line" message
+               rather than a weaker local pick. */
+            refreshTrainingPanel();
           }
           const hasMore=g.allLegalMoves.some(m=>m.moves.length>0);
           if(!hasMore){
@@ -2592,16 +2591,9 @@
         g.selected=null;g.validDests=[];g.destLabels={};
         g.allLegalMoves=generateMoves(g.state,g.remainingDice,0);
         if(g.training){
-          /* Show fast local result immediately, then update with server result if available */
-          g.analysis=analyzeMoves(g.state,g.remainingDice,0);
-          if(g.useServerAnalysis&&ANALYSIS_SERVER_URL){
-            const snapState=g.state;const snapDice=g.remainingDice.slice();
-            analyzeMovesServer(snapState,snapDice,0).then(serverResult=>{
-              /* Only update if state hasn't changed */
-              if(serverResult&&g.state===snapState&&g.training)g.analysis=serverResult;
-              tick();
-            }).catch(()=>{});
-          }
+          /* The turn-start gnubg plan still applies after an undo; just
+             re-derive from it (no local engine). */
+          refreshTrainingPanel();
         }
         g.message='Move undone.';tick();
       }
@@ -2749,18 +2741,29 @@
           worker.postMessage({state:g.state,dice:g.remainingDice,player:1,difficulty:g.difficulty});
         }
 
-        // Master difficulty uses the expert analysis server for top-tier play.
-        // Falls back to the local worker if the server is unreachable or returns nothing.
+        // Master difficulty is gnubg-only — never silently downgrade the
+        // opponent to the weak local engine. If the server is unreachable,
+        // pause with a clear message and auto-retry; the game resumes the
+        // moment the connection returns.
         if(g.difficulty==='master'&&ANALYSIS_SERVER_URL){
-          g.message='CPU thinking…';tick();
-          analyzeMovesServer(g.state,g.remainingDice,1).then(result=>{
-            if(result&&result.best&&result.best.moves){
-              g.message='';
-              playMoves(result.best.moves,result.best.state);
-            }else{
-              runLocalWorker();
-            }
-          }).catch(()=>runLocalWorker());
+          let attempt=0;
+          const tryServer=()=>{
+            g.message=attempt===0?'CPU thinking…':'Waiting for connection — Master needs internet…';
+            tick();
+            analyzeMovesServer(g.state,g.remainingDice,1).then(result=>{
+              if(result&&result.best&&result.best.moves){
+                g.message='';
+                playMoves(result.best.moves,result.best.state);
+              }else{
+                attempt++;
+                safeTimeout(tryServer,4000);
+              }
+            }).catch(()=>{
+              attempt++;
+              safeTimeout(tryServer,4000);
+            });
+          };
+          tryServer();
           return;
         }
 
@@ -3043,7 +3046,7 @@
       const uiState={selected:g.selected,validDests:g.validDests,lastMovedTo:g.lastMovedTo,destLabels:g.destLabels,lastMoveFrom:g.lastMoveFrom,lastMovePlayer:g.lastMovePlayer,moveId:g.moveId,remainingDice:g.remainingDice,phase:g.phase,currentPlayer:g.currentPlayer};
 
       // Training panel — compact, fits within container
-      const trainingPanel=g.training&&g.analysis&&g.analysis.best?React.createElement('div',{style:{
+      const trainingRichPanel=g.training&&g.analysis&&g.analysis.best?React.createElement('div',{style:{
         ...S.panel,width:'100%',maxWidth:'500px',marginTop:'2px',padding:'8px 10px',
       }},
         // Header + confidence + win rate
@@ -3095,6 +3098,24 @@
           })(),
         ),
       ):null;
+
+      // Status panel for the non-recommendation training states. Training is
+      // gnubg-only — these messages are honest about why there's no advice
+      // rather than silently substituting a weaker engine.
+      const trainingStatus=g.training&&g.analysis&&!g.analysis.best?(
+        g.analysis.loading?{txt:'Analyzing…',col:sk.uiAccent}:
+        g.analysis.offline?{txt:'Training analysis needs an internet connection.',col:'#c0392b'}:
+        g.analysis.offPlan?{txt:'Off the recommended line — full analysis resumes next roll.',col:sk.uiTextDim}:
+        null
+      ):null;
+      const trainingStatusPanel=trainingStatus?React.createElement('div',{style:{
+        ...S.panel,width:'100%',maxWidth:'500px',marginTop:'2px',padding:'8px 10px',
+      }},
+        React.createElement('div',{style:{fontSize:'9px',color:sk.uiAccent,letterSpacing:'2px',marginBottom:'3px'}},'STRATEGY'),
+        React.createElement('div',{style:{fontSize:'12px',color:trainingStatus.col}},trainingStatus.txt),
+      ):null;
+
+      const trainingPanel=trainingRichPanel||trainingStatusPanel;
 
       // ─── Controls block (reused in both layouts) ───
       const diceBlock=React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'center',gap:'8px',padding:isLand?'6px 0':'4px 0',flexShrink:0}},
