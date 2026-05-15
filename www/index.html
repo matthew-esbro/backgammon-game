@@ -2615,11 +2615,17 @@
           }
           const hasMore=g.allLegalMoves.some(m=>m.moves.length>0);
           if(!hasMore){
-            g.message='No more legal moves.';
+            /* Name the forfeited dice and hold the message long enough to
+               read. Backgammon requires playing as many dice as possible;
+               if an earlier move stranded the rest there is genuinely no
+               legal play, but at 800ms the old generic message flashed by
+               and felt like the turn ended for no reason. */
+            const left=g.remainingDice.slice().sort((a,b)=>a-b).join(' & ');
+            g.message='No legal move for the '+left+' — turn ends.';
             g.analysis=null;
             addHistory(0,g.dice,g.turnMoves);
             tick();
-            safeTimeout(()=>endTurn(),800);
+            safeTimeout(()=>endTurn(),2200);
             return;
           }
           g.allLegalMoves=g.allLegalMoves.filter(m=>m.moves.length>0);
@@ -2673,6 +2679,14 @@
       }
       /* Fast-forward: instantly resolve a race position by simulating roll+best-move for both players */
       function handleFastForward(){
+        /* Re-entry / state guards. Without these a stray double-tap (the FF
+           button can flicker back for a frame between fastForward clearing
+           and the GAME_OVER render) re-enters the loop on an already-decided
+           game, which combined with the game-over ad produced the reported
+           "ad fired, game not complete, could press FF again". */
+        if(g.fastForward)return;
+        if(g.phase!==P.ROLLING&&g.phase!==P.MOVING&&g.phase!==P.CPU_TURN&&g.phase!==P.CPU_ROLLING)return;
+        if(g.state.off[0]>=15||g.state.off[1]>=15)return;
         if(hasContactMT(g.state))return; /* still contact, can't FF */
         if(g.state.bar[0]>0||g.state.bar[1]>0)return;
         g.fastForward=true;
@@ -2703,10 +2717,11 @@
           g.lastMovedTo=null;g.lastMoveFrom=null;
           /* Quick visual update */
           tick();
-          /* Check for win after move */
-          if(g.state.off[0]>=15||g.state.off[1]>=15){
-            setTimeout(ffStep,30);return;
-          }
+          /* Win on this move -> end the game NOW. Scheduling another ffStep
+             cycle left a window where off>=15 but phase was still 'rolling'
+             and fastForward still true (the inconsistent state behind #3). */
+          if(g.state.off[0]>=15){g.fastForward=false;handleWin(0);tick();return}
+          if(g.state.off[1]>=15){g.fastForward=false;handleWin(1);tick();return}
           /* Switch turn */
           g.currentPlayer=1-g.currentPlayer;
           setTimeout(ffStep,30);
