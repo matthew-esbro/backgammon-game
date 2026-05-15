@@ -1181,7 +1181,12 @@
           cubeful:false,
         };
         const ctrl=new AbortController();
-        const timeoutId=setTimeout(()=>ctrl.abort(),5000);
+        /* 15s, not 5s: a hibernated Fly machine takes ~6-8s to cold-start
+           (VM wake + gnubg boot + Caddy). The UI already shows local
+           analysis instantly and upgrades when the server replies, so a
+           longer timeout has no UX cost — it just lets the cold-start
+           result actually arrive instead of aborting first. */
+        const timeoutId=setTimeout(()=>ctrl.abort(),15000);
         const resp=await fetch(ANALYSIS_SERVER_URL+'/api/v1/getmoves',{
           method:'POST',
           headers:{'Content-Type':'application/json'},
@@ -2074,6 +2079,18 @@
         const blob=new Blob([document.getElementById('ai-worker').textContent],{type:'application/javascript'});
         workerRef.current=new Worker(URL.createObjectURL(blob));
         return()=>workerRef.current&&workerRef.current.terminate();
+      },[]);
+
+      /* Warm the analysis server the moment the app loads (while the player
+         is still on the menu choosing options). Fly auto-stops idle machines;
+         this kick wakes one so it's ready by the time the first move needs
+         analysis, instead of the player eating a 6-8s cold start and getting
+         the local fallback on their opening move. Fire-and-forget. */
+      useEffect(()=>{
+        if(!ANALYSIS_SERVER_URL)return;
+        try{
+          fetch(ANALYSIS_SERVER_URL+'/health',{method:'GET',mode:'no-cors'}).catch(()=>{});
+        }catch(e){/* ignore */}
       },[]);
 
       // Force re-render on resize/orientation change so layout recalculates
