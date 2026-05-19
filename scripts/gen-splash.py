@@ -21,8 +21,8 @@ BG = (0xf0, 0xe8, 0xd0)       # Ivory uiBg1
 TXT = (0x7a, 0x48, 0x18)      # Ivory uiAccent
 SUB = (0x7a, 0x58, 0x38)      # Ivory uiTextDim
 
-TITLE_SIZE = 220
-SUB_SIZE = 52
+TITLE_SIZE = 150
+SUB_SIZE = 36
 
 
 def imserif(size):
