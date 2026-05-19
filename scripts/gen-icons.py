@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""iOS app icon (1024x1024): full-bleed backgammon board, vibrant warm wood.
+"""iOS app icon (1024x1024): a single bold backgammon "point" (triangle)
+with a clean chip-stack of checkers resting on it. Minimal flat
+pictogram in the Ivory brand palette (matches the Esbro Labs launch
+screen), with generous margins so it stays legible at home-screen size.
 
 Run from repo root:  python3 scripts/gen-icons.py
 Writes ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-512@2x.png
 
-No margin, no frame, no border, no checkers — just the playing surface
-(alternating points + center bar) filling the entire tile edge to edge
-(Apple applies the rounded-square mask). Palette is a richer, more
-saturated take on the in-game Ivory wood theme.
+Apple applies the rounded-square mask, so this draws full-bleed on a
+solid Ivory tile. Palette = Ivory Classic:
+  tile        #f0e8d0   Ivory uiBg1 (same as the launch screen)
+  point       #6e3f1c   deep walnut
+  chip fill   #f6e4b0   honey cream
+  chip rim    #6e3f1c   deep walnut
 """
 import os
 from PIL import Image, ImageDraw
@@ -18,39 +23,38 @@ ICON = os.path.join(REPO,
 
 S = 1024
 
-# Vibrant warm-wood palette (richer/higher-contrast than muted Ivory)
-BOARD_BG = (0xc9, 0x8a, 0x3e)   # saturated caramel
-PT_DARK  = (0x6e, 0x3f, 0x1c)   # deep walnut
-PT_LIGHT = (0xf2, 0xdc, 0xa0)   # warm honey cream
-BAR_BG   = (0x5a, 0x32, 0x16)   # darker walnut
+BG  = (0xf0, 0xe8, 0xd0)   # Ivory uiBg1 tile
+TRI = (0x6e, 0x3f, 0x1c)   # deep walnut point
+CF  = (0xf6, 0xe4, 0xb0)   # honey-cream chip face
+CR  = (0x6e, 0x3f, 0x1c)   # deep walnut chip rim
 
 
 def main():
-    img = Image.new("RGB", (S, S), BOARD_BG)
+    img = Image.new("RGB", (S, S), BG)
     d = ImageDraw.Draw(img)
+    cx = S / 2.0
 
-    barW = int(S * 0.085)
-    barX0 = (S - barW) // 2
-    barX1 = barX0 + barW
-    sideW = (S - barW) / 2.0
-    colW = sideW / 6.0
-    triH = S * 0.42
+    # Squat, wide point (reads as a pennant, not a pine tree).
+    half = S * 0.258
+    base_y = S * 0.762
+    apex_y = S * 0.252
+    d.polygon([(cx-half, base_y), (cx+half, base_y), (cx, apex_y)], fill=TRI)
 
-    def cL(i): return i * colW                 # left-of-bar columns 0..5
-    def cR(i): return barX1 + i * colW         # right-of-bar columns 0..5
-
-    # Full-bleed alternating triangles, top (apex down) + bottom (apex up).
-    for half, base in (("L", cL), ("R", cR)):
-        for i in range(6):
-            x0 = base(i); x1 = x0 + colW; xm = (x0 + x1) / 2.0
-            idx = i if half == "L" else i + 6
-            top = PT_DARK if idx % 2 == 0 else PT_LIGHT
-            bot = PT_LIGHT if idx % 2 == 0 else PT_DARK
-            d.polygon([(x0, 0), (x1, 0), (xm, triH)], fill=top)
-            d.polygon([(x0, S), (x1, S), (xm, S-triH)], fill=bot)
-
-    # Center bar, full height.
-    d.rectangle([barX0, 0, barX1, S], fill=BAR_BG)
+    # Chunky side-on chip stack: overlapping flat discs read as stacked
+    # game pieces and survive the 48px home-screen test.
+    rw = S * 0.142
+    rh = S * 0.056
+    step = rh * 1.34
+    n = 3
+    ow = max(3, int(rh * 0.17))
+    bottom = base_y - rh * 1.15
+    for k in range(n):
+        cy = bottom - k * step
+        d.ellipse([cx-rw, cy-rh, cx+rw, cy+rh], fill=CF)
+        d.ellipse([cx-rw, cy-rh, cx+rw, cy+rh], outline=CR, width=ow)
+    ty = bottom - (n-1) * step
+    hl = tuple(min(255, c+22) for c in CF)
+    d.ellipse([cx-rw*0.52, ty-rh*0.46, cx+rw*0.52, ty+rh*0.16], fill=hl)
 
     os.makedirs(os.path.dirname(ICON), exist_ok=True)
     img.save(ICON, "PNG", optimize=True)
