@@ -1,6 +1,6 @@
 {
   "appId": "com.esbrolabs.backgammon",
-  "appName": "Backgammon",
+  "appName": "Backgammon House",
   "webDir": "www",
   "plugins": {
     "SplashScreen": {
