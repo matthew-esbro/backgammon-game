@@ -2125,10 +2125,19 @@
       },[]);
 
       /* ─── AdMob ad unit IDs ───
-         These are Google's test IDs — replace with real ones from AdMob console before launch.
-         Test IDs always return ads but generate $0 revenue. */
-      const ADMOB_BANNER_ID = 'ca-app-pub-9690726274194822/3061579503'; // iOS banner (AdMob)
-      const ADMOB_INTERSTITIAL_ID = 'ca-app-pub-9690726274194822/1772548566'; // iOS interstitial (AdMob)
+         ADMOB_TESTING gates between Google's SAMPLE ad units (always serve
+         safe test ads on ANY device, real iPhone included — tap freely, $0
+         revenue, zero policy risk) and the real Esbro Labs units. MUST be
+         set to false (and the app rebuilt) as the LAST step before archiving
+         for the App Store, or live users would see test ads and you'd earn
+         nothing. */
+      const ADMOB_TESTING = true; // <-- FLIP TO false BEFORE APP STORE SUBMISSION
+      const ADMOB_BANNER_ID = ADMOB_TESTING
+        ? 'ca-app-pub-3940256099942544/2934735716'  // Google sample banner
+        : 'ca-app-pub-9690726274194822/3061579503'; // real iOS banner
+      const ADMOB_INTERSTITIAL_ID = ADMOB_TESTING
+        ? 'ca-app-pub-3940256099942544/4411468910'  // Google sample interstitial
+        : 'ca-app-pub-9690726274194822/1772548566'; // real iOS interstitial
 
       /* ─── Ads & IAP ─── */
       const [adsRemoved, setAdsRemoved] = useState(() => {
