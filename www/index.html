@@ -2131,7 +2131,7 @@
          set to false (and the app rebuilt) as the LAST step before archiving
          for the App Store, or live users would see test ads and you'd earn
          nothing. */
-      const ADMOB_TESTING = true; // <-- FLIP TO false BEFORE APP STORE SUBMISSION
+      const ADMOB_TESTING = false; // false = real ads (production). Set true only for safe device testing.
       const ADMOB_BANNER_ID = ADMOB_TESTING
         ? 'ca-app-pub-3940256099942544/2934735716'  // Google sample banner
         : 'ca-app-pub-9690726274194822/3061579503'; // real iOS banner
