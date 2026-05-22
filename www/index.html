@@ -2139,6 +2139,11 @@
         ? 'ca-app-pub-3940256099942544/4411468910'  // Google sample interstitial
         : 'ca-app-pub-9690726274194822/1772548566'; // real iOS interstitial
 
+      /* SCREENSHOT_MODE hides ALL ads (banner + interstitial + the banner
+         spacer) so App Store screenshots are clean. LOCAL/DEV ONLY — must be
+         false for any build you ship, or live users see no ads (zero revenue). */
+      const SCREENSHOT_MODE = false; // flip to true to hide all ads for App Store screenshots
+
       /* ─── Ads & IAP ─── */
       const [adsRemoved, setAdsRemoved] = useState(() => {
         try { return localStorage.getItem('adsRemoved') === 'true'; } catch(e) { return false; }
@@ -2214,7 +2219,7 @@
 
       // Banner ad lifecycle
       useEffect(() => {
-        if (adsRemoved || !adMobReady || typeof Capacitor === 'undefined') return;
+        if (adsRemoved || SCREENSHOT_MODE || !adMobReady || typeof Capacitor === 'undefined') return;
         const { AdMob } = Capacitor.Plugins;
         if (!AdMob) return;
         AdMob.showBanner({ adId: ADMOB_BANNER_ID, adSize: 'BANNER', position: 'BOTTOM_CENTER', margin: 0 }).catch(() => {});
@@ -2222,7 +2227,7 @@
       }, [adsRemoved, adMobReady]);
 
       const showInterstitialAd = async () => {
-        if (adsRemoved || !interstitialLoaded || typeof Capacitor === 'undefined') return;
+        if (adsRemoved || SCREENSHOT_MODE || !interstitialLoaded || typeof Capacitor === 'undefined') return;
         // Global 60s cooldown across ALL interstitial triggers. AdMob bans
         // accounts for ads on every action / back-to-back ads; this also
         // prevents the game-over ad and a MENU-tap ad from doubling up.
@@ -3316,7 +3321,7 @@
         // Spacer pushes ad to bottom
         React.createElement('div',{style:{flex:1}}),
         // Ad banner spacer
-        !adsRemoved?React.createElement('div',{style:{height:'60px',flexShrink:0}}):null,
+        (!adsRemoved&&!SCREENSHOT_MODE)?React.createElement('div',{style:{height:'60px',flexShrink:0}}):null,
       );
     }
 
