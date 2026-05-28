@@ -2810,6 +2810,15 @@
           nextCpuMove();
         }
 
+        /* Resolve "no legal moves" FIRST, before any server call. When the CPU
+           is danced or blocked (common once the human has a strong/closed
+           board — i.e. exactly when the human is winning), the engine
+           legitimately returns no plays. The Master branch below would
+           otherwise misread that null result as "server offline" and hang
+           forever on "Master needs internet…". Mirrors beginPlayerTurn. */
+        const cpuLegal=generateMoves(g.state,g.remainingDice,1);
+        if(!cpuLegal.some(m=>m.moves.length>0)){playMoves([],g.state);return;}
+
         function runLocalWorker(){
           worker.onmessage=(e)=>{
             const{moves,state:finalState}=e.data;
